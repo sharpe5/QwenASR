@@ -1093,13 +1093,32 @@ fn im2col(input: &[f32], cols: &mut [f32], c_in: usize, h_in: usize, w_in: usize
 pub fn conv2d(out: &mut [f32], input: &[f32], weight: &[f32], bias: Option<&[f32]>,
               c_in: usize, c_out: usize, h_in: usize, w_in: usize,
               kh: usize, kw: usize, stride: usize, padding: usize) {
+    conv2d_buf(out, input, weight, bias, c_in, c_out, h_in, w_in, kh, kw, stride, padding, None);
+}
+
+/// Like `conv2d` but accepts an optional pre-allocated scratch buffer for im2col columns.
+pub fn conv2d_buf(out: &mut [f32], input: &[f32], weight: &[f32], bias: Option<&[f32]>,
+              c_in: usize, c_out: usize, h_in: usize, w_in: usize,
+              kh: usize, kw: usize, stride: usize, padding: usize,
+              cols_scratch: Option<&mut Vec<f32>>) {
     let _pg = ProfileGuard::new(&PROF.conv2d_op);
     let h_out = (h_in + 2 * padding - kh) / stride + 1;
     let w_out = (w_in + 2 * padding - kw) / stride + 1;
     let patch_size = c_in * kh * kw;
     let spatial_out = h_out * w_out;
 
-    let mut cols = vec![0.0f32; patch_size * spatial_out];
+    let needed = patch_size * spatial_out;
+    let mut _owned_cols;
+    let cols: &mut [f32] = match cols_scratch {
+        Some(buf) => {
+            if buf.len() < needed { buf.resize(needed, 0.0); }
+            &mut buf[..needed]
+        }
+        None => {
+            _owned_cols = vec![0.0f32; needed];
+            &mut _owned_cols
+        }
+    };
 
     // Thread im2col across col_rows (each row is independent)
     let n_threads = get_num_threads();
@@ -1131,7 +1150,7 @@ pub fn conv2d(out: &mut [f32], input: &[f32], weight: &[f32], bias: Option<&[f32
             }
         });
     } else {
-        im2col(input, &mut cols, c_in, h_in, w_in, kh, kw, stride, padding, h_out, w_out);
+        im2col(input, cols, c_in, h_in, w_in, kh, kw, stride, padding, h_out, w_out);
     }
 
     // GEMM: weight[c_out, patch_size] @ cols[patch_size, spatial_out] = out[c_out, spatial_out]

@@ -261,6 +261,7 @@ impl Encoder {
         let mut local_c3 = vec![0.0f32; CONV_HIDDEN * h3_max * w3_max];
         let mut local_reshaped = vec![0.0f32; w3_max * cpd_max];
         let mut local_pe = vec![0.0f32; w3_max * d_model];
+        let mut conv_cols_scratch: Vec<f32> = Vec::new();
 
         // Process each chunk through Conv2D + reshape + project + sinusoidal PE
         for &(start, end, w3) in &chunk_sizes {
@@ -278,9 +279,9 @@ impl Encoder {
             let w1 = (chunk_w + 2 - 3) / 2 + 1;
             let c1_len = CONV_HIDDEN * h1 * w1;
             let c1 = &mut local_c1[..c1_len];
-            kernels::conv2d(
+            kernels::conv2d_buf(
                 c1, chunk_mel, &self.conv1_weight, Some(&self.conv1_bias),
-                1, CONV_HIDDEN, 128, chunk_w, 3, 3, 2, 1,
+                1, CONV_HIDDEN, 128, chunk_w, 3, 3, 2, 1, Some(&mut conv_cols_scratch),
             );
             kernels::gelu(c1, c1_len);
 
@@ -289,9 +290,9 @@ impl Encoder {
             let w2 = (w1 + 2 - 3) / 2 + 1;
             let c2_len = CONV_HIDDEN * h2 * w2;
             let c2 = &mut local_c2[..c2_len];
-            kernels::conv2d(
+            kernels::conv2d_buf(
                 c2, c1, &self.conv2_weight, Some(&self.conv2_bias),
-                CONV_HIDDEN, CONV_HIDDEN, h1, w1, 3, 3, 2, 1,
+                CONV_HIDDEN, CONV_HIDDEN, h1, w1, 3, 3, 2, 1, Some(&mut conv_cols_scratch),
             );
             kernels::gelu(c2, c2_len);
 
@@ -301,9 +302,9 @@ impl Encoder {
             debug_assert_eq!(_w3_calc, w3);
             let c3_len = CONV_HIDDEN * h3 * w3;
             let c3 = &mut local_c3[..c3_len];
-            kernels::conv2d(
+            kernels::conv2d_buf(
                 c3, c2, &self.conv3_weight, Some(&self.conv3_bias),
-                CONV_HIDDEN, CONV_HIDDEN, h2, w2, 3, 3, 2, 1,
+                CONV_HIDDEN, CONV_HIDDEN, h2, w2, 3, 3, 2, 1, Some(&mut conv_cols_scratch),
             );
             kernels::gelu(c3, c3_len);
 
