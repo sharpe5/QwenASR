@@ -697,8 +697,24 @@ pub unsafe fn linear_nobias_bf16_scratch(y: &mut [f32], x: &[f32], w_bf16: *cons
         return;
     }
     let n = out_dim * in_dim;
-    let src = unsafe { std::slice::from_raw_parts(w_bf16, n) };
-    bf16_to_f32_buf(&mut scratch[..n], src);
+    // Thread BF16→F32 conversion for large weight matrices
+    let nt = get_num_threads();
+    if nt > 1 && n > 65536 {
+        let src_ptr = w_bf16 as usize;
+        let dst_ptr = scratch.as_mut_ptr() as usize;
+        parallel_for(|tid, nt| {
+            let chunk = n.div_ceil(nt);
+            let start = tid * chunk;
+            let end = (start + chunk).min(n);
+            if start >= end { return; }
+            let src_slice = unsafe { std::slice::from_raw_parts((src_ptr as *const u16).add(start), end - start) };
+            let dst_slice = unsafe { std::slice::from_raw_parts_mut((dst_ptr as *mut f32).add(start), end - start) };
+            bf16_to_f32_buf(dst_slice, src_slice);
+        });
+    } else {
+        let src = unsafe { std::slice::from_raw_parts(w_bf16, n) };
+        bf16_to_f32_buf(&mut scratch[..n], src);
+    }
     linear_nobias(y, x, &scratch[..n], seq_len, in_dim, out_dim);
 }
 
