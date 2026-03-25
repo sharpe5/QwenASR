@@ -500,7 +500,6 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     let mut enc_cached_seq_total = 0usize;
 
     // Pre-allocated buffers for streaming loop (avoid per-chunk heap allocs)
-    let mut enc_output_buf: Vec<f32> = Vec::new();
     let mut input_embeds_buf: Vec<f32> = Vec::new();
 
     // Previous prefill embeddings for LCP reuse
@@ -549,23 +548,6 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             continue;
         }
 
-        // Assemble encoder output (reuse buffer)
-        let enc_total = enc_seq_len * dim;
-        if enc_output_buf.len() < enc_total {
-            enc_output_buf.resize(enc_total, 0.0);
-        }
-        let enc_output = &mut enc_output_buf[..enc_total];
-        let mut enc_off = 0;
-        for w in &enc_cache {
-            enc_output[enc_off * dim..(enc_off + w.seq_len) * dim]
-                .copy_from_slice(&w.enc_output);
-            enc_off += w.seq_len;
-        }
-        if partial_seq > 0 {
-            enc_output[enc_off * dim..(enc_off + partial_seq) * dim]
-                .copy_from_slice(&partial_enc);
-        }
-
         let enc_ms = elapsed_ms(t0);
         ctx.perf_encode_ms += enc_ms;
 
@@ -605,9 +587,18 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             off += 1;
         }
 
-        for i in 0..enc_seq_len {
-            input_embeds[(prefix_len + i) * dim..(prefix_len + i + 1) * dim]
-                .copy_from_slice(&enc_output[i * dim..(i + 1) * dim]);
+        // Copy encoder outputs directly into input_embeds (skip intermediate buffer)
+        {
+            let mut enc_off = prefix_len;
+            for w in &enc_cache {
+                input_embeds[enc_off * dim..(enc_off + w.seq_len) * dim]
+                    .copy_from_slice(&w.enc_output);
+                enc_off += w.seq_len;
+            }
+            if partial_seq > 0 {
+                input_embeds[enc_off * dim..(enc_off + partial_seq) * dim]
+                    .copy_from_slice(&partial_enc);
+            }
         }
 
         let suffix_off = prefix_len + enc_seq_len;
