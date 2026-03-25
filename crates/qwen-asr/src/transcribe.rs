@@ -668,8 +668,12 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             &mut ctx.dec_bufs, last_embed,
         );
 
-        // Save for next chunk
-        prev_prefill_embeds = input_embeds[..prefill_len * dim].to_vec();
+        // Save for next chunk (reuse buffer)
+        let copy_len = prefill_len * dim;
+        if prev_prefill_embeds.len() < copy_len {
+            prev_prefill_embeds.resize(copy_len, 0.0);
+        }
+        prev_prefill_embeds[..copy_len].copy_from_slice(&input_embeds[..copy_len]);
         prev_prefill_len = prefill_len;
 
         let prefill_ms = elapsed_ms(t0);
@@ -703,7 +707,8 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             stale_count += 1;
         } else {
             stale_count = 0;
-            prev_tail_snapshot = raw_tokens.clone();
+            prev_tail_snapshot.clear();
+            prev_tail_snapshot.extend_from_slice(&raw_tokens);
         }
         let (best_reps, _) = stream_tail_repeat_blocks(&raw_tokens, STREAM_DEGEN_MAX_PERIOD);
         let is_degen = stale_count >= STREAM_STALE_CHUNKS
