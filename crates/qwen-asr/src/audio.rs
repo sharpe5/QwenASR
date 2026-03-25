@@ -337,18 +337,16 @@ pub fn mel_spectrogram(samples: &[f32]) -> Option<(Vec<f32>, usize)> {
 
     // 2. DFT via BLAS: re = dft_cos @ windowed_all, im = dft_sin @ windowed_all
     //    [N_FREQ × N_FFT] @ [N_FFT × n_frames] = [N_FREQ × n_frames]
-    let mut re = vec![0.0f32; n_freqs * n_frames];
+    let mut power = vec![0.0f32; n_freqs * n_frames];
     let mut im = vec![0.0f32; n_freqs * n_frames];
-    kernels::matmul_nn(&mut re, dft_cos, &windowed_all, n_freqs, N_FFT, n_frames);
+    kernels::matmul_nn(&mut power, dft_cos, &windowed_all, n_freqs, N_FFT, n_frames);
     kernels::matmul_nn(&mut im, dft_sin, &windowed_all, n_freqs, N_FFT, n_frames);
     drop(windowed_all);
 
-    // 3. Power spectrum: power[k * n_frames + t] = re² + im²
-    let mut power = vec![0.0f32; n_freqs * n_frames];
+    // 3. Power spectrum in-place: power[i] = re[i]² + im[i]²
     for i in 0..n_freqs * n_frames {
-        power[i] = re[i] * re[i] + im[i] * im[i];
+        power[i] = power[i] * power[i] + im[i] * im[i];
     }
-    drop(re);
     drop(im);
 
     // 4. Mel filter bank via BLAS: mel_raw = mel_filters @ power
