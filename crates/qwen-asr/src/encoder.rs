@@ -21,6 +21,9 @@ pub struct EncLayer {
     pub fc2_bias: Vec<f32>,
     pub ffn_norm_weight: Vec<f32>,
     pub ffn_norm_bias: Vec<f32>,
+    // Fused QKV: [3*d_model, d_model] weight + [3*d_model] bias
+    pub wqkv_weight: Vec<f32>,
+    pub wqkv_bias: Vec<f32>,
 }
 
 pub struct EncoderBuffers {
@@ -28,6 +31,7 @@ pub struct EncoderBuffers {
     pub q: Vec<f32>,
     pub k: Vec<f32>,
     pub v: Vec<f32>,
+    pub qkv: Vec<f32>,
     pub attn_out: Vec<f32>,
     pub proj_out: Vec<f32>,
     pub ffn_mid: Vec<f32>,
@@ -48,6 +52,7 @@ impl EncoderBuffers {
             q: Vec::new(),
             k: Vec::new(),
             v: Vec::new(),
+            qkv: Vec::new(),
             attn_out: Vec::new(),
             proj_out: Vec::new(),
             ffn_mid: Vec::new(),
@@ -68,6 +73,7 @@ impl EncoderBuffers {
         self.q.resize(new_cap * d_model, 0.0);
         self.k.resize(new_cap * d_model, 0.0);
         self.v.resize(new_cap * d_model, 0.0);
+        self.qkv.resize(new_cap * 3 * d_model, 0.0);
         self.attn_out.resize(new_cap * d_model, 0.0);
         self.proj_out.resize(new_cap * d_model, 0.0);
         self.ffn_mid.resize(new_cap * ffn_dim, 0.0);
@@ -135,13 +141,31 @@ impl Encoder {
         for i in 0..cfg.enc_layers {
             let lp = format!("{}layers.{}", p, i);
 
+            let wq_weight = load_bf16_as_f32(ms, &format!("{}.self_attn.q_proj.weight", lp))?;
+            let wq_bias = load_f32(ms, &format!("{}.self_attn.q_proj.bias", lp))?;
+            let wk_weight = load_bf16_as_f32(ms, &format!("{}.self_attn.k_proj.weight", lp))?;
+            let wk_bias = load_f32(ms, &format!("{}.self_attn.k_proj.bias", lp))?;
+            let wv_weight = load_bf16_as_f32(ms, &format!("{}.self_attn.v_proj.weight", lp))?;
+            let wv_bias = load_f32(ms, &format!("{}.self_attn.v_proj.bias", lp))?;
+
+            // Fuse QKV weights: stack [Q; K; V] into [3*d_model, d_model]
+            let d = cfg.enc_d_model;
+            let mut wqkv_weight = vec![0.0f32; 3 * d * d];
+            wqkv_weight[..d * d].copy_from_slice(&wq_weight);
+            wqkv_weight[d * d..2 * d * d].copy_from_slice(&wk_weight);
+            wqkv_weight[2 * d * d..3 * d * d].copy_from_slice(&wv_weight);
+            let mut wqkv_bias = vec![0.0f32; 3 * d];
+            wqkv_bias[..d].copy_from_slice(&wq_bias);
+            wqkv_bias[d..2 * d].copy_from_slice(&wk_bias);
+            wqkv_bias[2 * d..3 * d].copy_from_slice(&wv_bias);
+
             let layer = EncLayer {
-                wq_weight: load_bf16_as_f32(ms, &format!("{}.self_attn.q_proj.weight", lp))?,
-                wq_bias: load_f32(ms, &format!("{}.self_attn.q_proj.bias", lp))?,
-                wk_weight: load_bf16_as_f32(ms, &format!("{}.self_attn.k_proj.weight", lp))?,
-                wk_bias: load_f32(ms, &format!("{}.self_attn.k_proj.bias", lp))?,
-                wv_weight: load_bf16_as_f32(ms, &format!("{}.self_attn.v_proj.weight", lp))?,
-                wv_bias: load_f32(ms, &format!("{}.self_attn.v_proj.bias", lp))?,
+                wq_weight,
+                wq_bias,
+                wk_weight,
+                wk_bias,
+                wv_weight,
+                wv_bias,
                 wo_weight: load_bf16_as_f32(ms, &format!("{}.self_attn.out_proj.weight", lp))?,
                 wo_bias: load_f32(ms, &format!("{}.self_attn.out_proj.bias", lp))?,
                 attn_norm_weight: load_f32(ms, &format!("{}.self_attn_layer_norm.weight", lp))?,
@@ -152,6 +176,8 @@ impl Encoder {
                 fc2_bias: load_f32(ms, &format!("{}.fc2.bias", lp))?,
                 ffn_norm_weight: load_f32(ms, &format!("{}.final_layer_norm.weight", lp))?,
                 ffn_norm_bias: load_f32(ms, &format!("{}.final_layer_norm.bias", lp))?,
+                wqkv_weight,
+                wqkv_bias,
             };
             layers.push(layer);
         }
@@ -332,12 +358,17 @@ impl Encoder {
             kernels::layer_norm(&mut bufs.x_norm[..td], &x, &layer.attn_norm_weight, &layer.attn_norm_bias,
                               total_tokens, d_model, 1e-5);
 
-            kernels::linear(&mut bufs.q[..td], &bufs.x_norm[..td], &layer.wq_weight, Some(&layer.wq_bias),
-                          total_tokens, d_model, d_model);
-            kernels::linear(&mut bufs.k[..td], &bufs.x_norm[..td], &layer.wk_weight, Some(&layer.wk_bias),
-                          total_tokens, d_model, d_model);
-            kernels::linear(&mut bufs.v[..td], &bufs.x_norm[..td], &layer.wv_weight, Some(&layer.wv_bias),
-                          total_tokens, d_model, d_model);
+            // Fused QKV projection: one BLAS call instead of three
+            let tqkv = total_tokens * 3 * d_model;
+            kernels::linear(&mut bufs.qkv[..tqkv], &bufs.x_norm[..td], &layer.wqkv_weight, Some(&layer.wqkv_bias),
+                          total_tokens, d_model, 3 * d_model);
+            // Split QKV: qkv is [total_tokens, 3*d_model], extract Q, K, V
+            for t in 0..total_tokens {
+                let src = t * 3 * d_model;
+                bufs.q[t * d_model..(t + 1) * d_model].copy_from_slice(&bufs.qkv[src..src + d_model]);
+                bufs.k[t * d_model..(t + 1) * d_model].copy_from_slice(&bufs.qkv[src + d_model..src + 2 * d_model]);
+                bufs.v[t * d_model..(t + 1) * d_model].copy_from_slice(&bufs.qkv[src + 2 * d_model..src + 3 * d_model]);
+            }
 
             kernels::bidirectional_attention(&mut bufs.attn_out[..td], &bufs.q[..td], &bufs.k[..td], &bufs.v[..td],
                                            total_tokens, n_heads, head_dim, scale,
