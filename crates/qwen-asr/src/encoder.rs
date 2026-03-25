@@ -390,13 +390,12 @@ impl Encoder {
                           total_tokens, ffn_dim, d_model);
         }
 
-        // Final LayerNorm: use x_norm as temp, then swap into x
+        // Final LayerNorm
         kernels::layer_norm(&mut bufs.x_norm[..td], &x, &self.ln_post_weight, &self.ln_post_bias,
                           total_tokens, d_model, 1e-5);
-        x[..td].copy_from_slice(&bufs.x_norm[..td]);
 
-        // Projection: proj1 (GELU) -> proj2 (reuse scratch buffers)
-        kernels::linear(&mut bufs.q[..td], &x, &self.proj1_weight, Some(&self.proj1_bias),
+        // Projection: proj1 (GELU) -> proj2 (use x_norm directly, skip copy back to x)
+        kernels::linear(&mut bufs.q[..td], &bufs.x_norm[..td], &self.proj1_weight, Some(&self.proj1_bias),
                        total_tokens, d_model, d_model);
         kernels::gelu(&mut bufs.q[..td], td);
 
