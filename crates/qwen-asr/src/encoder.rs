@@ -220,12 +220,28 @@ impl Encoder {
         let mut x = vec![0.0f32; total_tokens * d_model];
         let mut token_offset = 0;
 
+        // Pre-allocate conv stem buffers for max chunk width (reused across chunks)
+        let max_chunk_w = chunk_sizes.iter().map(|&(s, e, _)| e - s).max().unwrap_or(0);
+        let h1_max = (128 + 2 - 3) / 2 + 1;
+        let w1_max = (max_chunk_w + 2 - 3) / 2 + 1;
+        let h2_max = (h1_max + 2 - 3) / 2 + 1;
+        let w2_max = (w1_max + 2 - 3) / 2 + 1;
+        let h3_max = (h2_max + 2 - 3) / 2 + 1;
+        let w3_max = (w2_max + 2 - 3) / 2 + 1;
+        let cpd_max = CONV_HIDDEN * h3_max;
+        let mut local_chunk_mel = vec![0.0f32; 128 * max_chunk_w];
+        let mut local_c1 = vec![0.0f32; CONV_HIDDEN * h1_max * w1_max];
+        let mut local_c2 = vec![0.0f32; CONV_HIDDEN * h2_max * w2_max];
+        let mut local_c3 = vec![0.0f32; CONV_HIDDEN * h3_max * w3_max];
+        let mut local_reshaped = vec![0.0f32; w3_max * cpd_max];
+        let mut local_pe = vec![0.0f32; w3_max * d_model];
+
         // Process each chunk through Conv2D + reshape + project + sinusoidal PE
         for &(start, end, w3) in &chunk_sizes {
             let chunk_w = end - start;
 
             // Extract chunk mel: [128, chunk_w]
-            let mut chunk_mel = vec![0.0f32; 128 * chunk_w];
+            let chunk_mel = &mut local_chunk_mel[..128 * chunk_w];
             for m in 0..128 {
                 chunk_mel[m * chunk_w..(m + 1) * chunk_w]
                     .copy_from_slice(&mel[m * mel_frames + start..m * mel_frames + end]);
@@ -234,38 +250,41 @@ impl Encoder {
             // Conv2D layer 1: [1, 128, chunk_w] -> [480, h1, w1]
             let h1 = (128 + 2 - 3) / 2 + 1; // 64
             let w1 = (chunk_w + 2 - 3) / 2 + 1;
-            let mut c1 = vec![0.0f32; CONV_HIDDEN * h1 * w1];
+            let c1_len = CONV_HIDDEN * h1 * w1;
+            let c1 = &mut local_c1[..c1_len];
             kernels::conv2d(
-                &mut c1, &chunk_mel, &self.conv1_weight, Some(&self.conv1_bias),
+                c1, chunk_mel, &self.conv1_weight, Some(&self.conv1_bias),
                 1, CONV_HIDDEN, 128, chunk_w, 3, 3, 2, 1,
             );
-            kernels::gelu(&mut c1, CONV_HIDDEN * h1 * w1);
+            kernels::gelu(c1, c1_len);
 
             // Conv2D layer 2: [480, h1, w1] -> [480, h2, w2]
             let h2 = (h1 + 2 - 3) / 2 + 1; // 32
             let w2 = (w1 + 2 - 3) / 2 + 1;
-            let mut c2 = vec![0.0f32; CONV_HIDDEN * h2 * w2];
+            let c2_len = CONV_HIDDEN * h2 * w2;
+            let c2 = &mut local_c2[..c2_len];
             kernels::conv2d(
-                &mut c2, &c1, &self.conv2_weight, Some(&self.conv2_bias),
+                c2, c1, &self.conv2_weight, Some(&self.conv2_bias),
                 CONV_HIDDEN, CONV_HIDDEN, h1, w1, 3, 3, 2, 1,
             );
-            kernels::gelu(&mut c2, CONV_HIDDEN * h2 * w2);
+            kernels::gelu(c2, c2_len);
 
             // Conv2D layer 3: [480, h2, w2] -> [480, h3, w3]
             let h3 = (h2 + 2 - 3) / 2 + 1; // 16
             let _w3_calc = (w2 + 2 - 3) / 2 + 1;
             debug_assert_eq!(_w3_calc, w3);
-            let mut c3 = vec![0.0f32; CONV_HIDDEN * h3 * w3];
+            let c3_len = CONV_HIDDEN * h3 * w3;
+            let c3 = &mut local_c3[..c3_len];
             kernels::conv2d(
-                &mut c3, &c2, &self.conv3_weight, Some(&self.conv3_bias),
+                c3, c2, &self.conv3_weight, Some(&self.conv3_bias),
                 CONV_HIDDEN, CONV_HIDDEN, h2, w2, 3, 3, 2, 1,
             );
-            kernels::gelu(&mut c3, CONV_HIDDEN * h3 * w3);
+            kernels::gelu(c3, c3_len);
 
             // Reshape [480, h3, w3] -> [w3, 480*h3]
             // Loop order: ch → f → t for sequential reads from c3
             let conv_proj_dim = CONV_HIDDEN * h3;
-            let mut reshaped = vec![0.0f32; w3 * conv_proj_dim];
+            let reshaped = &mut local_reshaped[..w3 * conv_proj_dim];
             for ch in 0..CONV_HIDDEN {
                 for f in 0..h3 {
                     let src_off = ch * h3 * w3 + f * w3;
@@ -278,12 +297,12 @@ impl Encoder {
 
             // Project: [w3, 7680] -> [w3, d_model]
             let projected = &mut x[token_offset * d_model..(token_offset + w3) * d_model];
-            kernels::linear_nobias(projected, &reshaped, &self.conv_out_weight, w3, conv_proj_dim, d_model);
+            kernels::linear_nobias(projected, reshaped, &self.conv_out_weight, w3, conv_proj_dim, d_model);
 
             // Add per-chunk sinusoidal PE
-            let mut pe = vec![0.0f32; w3 * d_model];
-            kernels::sinusoidal_pe(&mut pe, w3, d_model);
-            kernels::add_inplace(projected, &pe, w3 * d_model);
+            let pe = &mut local_pe[..w3 * d_model];
+            kernels::sinusoidal_pe(pe, w3, d_model);
+            kernels::add_inplace(projected, pe, w3 * d_model);
 
             token_offset += w3;
         }
