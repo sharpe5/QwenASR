@@ -499,6 +499,10 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     let mut enc_cache: Vec<EncWindow> = Vec::new();
     let mut enc_cached_seq_total = 0usize;
 
+    // Pre-allocated buffers for streaming loop (avoid per-chunk heap allocs)
+    let mut enc_output_buf: Vec<f32> = Vec::new();
+    let mut input_embeds_buf: Vec<f32> = Vec::new();
+
     // Previous prefill embeddings for LCP reuse
     let mut prev_prefill_embeds: Vec<f32> = Vec::new();
     let mut prev_prefill_len = 0usize;
@@ -545,8 +549,12 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             continue;
         }
 
-        // Assemble encoder output
-        let mut enc_output = vec![0.0f32; enc_seq_len * dim];
+        // Assemble encoder output (reuse buffer)
+        let enc_total = enc_seq_len * dim;
+        if enc_output_buf.len() < enc_total {
+            enc_output_buf.resize(enc_total, 0.0);
+        }
+        let enc_output = &mut enc_output_buf[..enc_total];
         let mut enc_off = 0;
         for w in &enc_cache {
             enc_output[enc_off * dim..(enc_off + w.seq_len) * dim]
@@ -575,7 +583,11 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         let suffix_len = SUFFIX_BASE.len() + n_force_prompt_tokens;
         let total_seq = prefix_len + enc_seq_len + suffix_len + n_prefix_tokens;
 
-        let mut input_embeds = vec![0.0f32; total_seq * dim];
+        let embed_total = total_seq * dim;
+        if input_embeds_buf.len() < embed_total {
+            input_embeds_buf.resize(embed_total, 0.0);
+        }
+        let input_embeds = &mut input_embeds_buf[..embed_total];
         let mut off = 0;
 
         for &tok in PREFIX_HEAD {
