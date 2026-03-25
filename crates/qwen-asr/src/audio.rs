@@ -408,11 +408,11 @@ pub fn compact_silence(samples: &[f32]) -> Vec<f32> {
         smooth_vals[w] = smooth;
     }
 
-    // Adaptive threshold from 25th percentile
-    let mut sorted = smooth_vals.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Adaptive threshold from 25th percentile (quickselect, O(n))
+    let mut scratch = smooth_vals.clone();
     let p25 = ((n_win - 1) as f32 * 0.25) as usize;
-    let noise_floor = sorted[p25];
+    scratch.select_nth_unstable_by(p25, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let noise_floor = scratch[p25];
     let thresh = (noise_floor * 1.8).clamp(base_thresh, max_thresh);
 
     let mut is_voice = vec![false; n_win];
