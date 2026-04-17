@@ -4,36 +4,138 @@
 // ignore_for_file: invalid_use_of_internal_member, unused_import, unnecessary_import
 
 import '../frb_generated.dart';
+import 'alignment.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<QwenAsrEngine>>
-abstract class QwenAsrEngine implements RustOpaqueInterface {
-  /// Load model from a directory path. Returns None if loading fails.
-  static Future<QwenAsrEngine?> load({
-    required String modelDir,
-    required int nThreads,
-    required int verbosity,
-  }) => RustLib.instance.api.crateApiQwenAsrBridgeQwenAsrEngineLoad(
-    modelDir: modelDir,
-    nThreads: nThreads,
-    verbosity: verbosity,
-  );
 
-  /// Get last transcription performance stats as a formatted string.
-  String perfStats();
+            // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`
 
-  /// Set the forced language. Returns false if the language is invalid.
-  bool setLanguage({required String language});
 
-  /// Set the segment duration in seconds (0 = no segmentation).
-  void setSegmentSec({required double sec});
+            
 
-  /// Transcribe a WAV file at the given path.
-  Future<String?> transcribeFile({required String wavPath});
+            
+                // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<QwenAsrEngine>>
+                abstract class QwenAsrEngine implements RustOpaqueInterface {
+                    /// Perform forced alignment on audio with a known transcript.
+///
+/// Returns word-level timestamps showing when each word was spoken.
+/// Requires an aligner model (qwen3-aligner-0.6b).
+///
+/// [samples] must be f32 PCM at 16kHz, mono.
+/// [text] is the known transcript to align.
+/// [language] controls word splitting - use "Chinese", "Japanese", 
+/// "Korean", "Cantonese" for character-level, anything else for word-level.
+ Future<AlignmentResult>  alignWords({required List<double> samples , required String text , required String language });
 
-  /// Transcribe raw PCM f32 samples (16kHz mono).
-  Future<String?> transcribePcm({required List<double> samples});
 
-  /// Transcribe from a WAV file buffer (bytes).
-  Future<String?> transcribeWavBuffer({required List<int> wavData});
-}
+/// Check if the loaded model is a forced aligner.
+ bool  isAligner();
+
+
+/// Load model from a directory path.
+/// 
+/// Returns an error if:
+/// - The directory doesn't exist
+/// - Required model files are missing
+/// - Thread count is invalid
+static Future<QwenAsrEngine>  load({required String modelDir , required int nThreads , required int verbosity })=>RustLib.instance.api.crateApiQwenAsrBridgeQwenAsrEngineLoad(modelDir: modelDir, nThreads: nThreads, verbosity: verbosity);
+
+
+/// Get model information.
+ ModelInfo  modelInfo();
+
+
+/// Get last transcription performance stats as a formatted string.
+ String  perfStats();
+
+
+/// Set the forced language. Returns false if the language is invalid.
+ bool  setLanguage({required String language });
+
+
+/// Enable past text conditioning for better context in streaming.
+ void  setPastTextConditioning({required bool enable });
+
+
+/// Set an optional text prompt to guide transcription.
+/// Pass empty string or null to clear.
+ void  setPrompt({String? prompt });
+
+
+/// Set the segment duration in seconds (0 = no segmentation).
+ void  setSegmentSec({required double sec });
+
+
+/// Enable/disable silence skipping for long recordings.
+ void  setSkipSilence({required bool skip });
+
+
+/// Configure streaming chunk size in seconds (default 2.0).
+/// Valid range: 0.5 to 10.0 seconds.
+ void  setStreamChunkSec({required double sec });
+
+
+/// Configure max new tokens per streaming chunk (default 32).
+ void  setStreamMaxNewTokens({required int tokens });
+
+
+/// Configure token rollback window for streaming (default 5).
+ void  setStreamRollback({required int tokens });
+
+
+/// Configure unfixed chunks count before emitting (default 2).
+ void  setStreamUnfixedChunks({required int chunks });
+
+
+/// Transcribe a WAV file at the given path.
+/// 
+/// Returns an error if the file doesn't exist or transcription fails.
+ Future<String>  transcribeFile({required String wavPath });
+
+
+/// Transcribe raw PCM f32 samples (16kHz mono, range [-1.0, 1.0]).
+/// 
+/// Returns an error if samples are empty or too short.
+ Future<String>  transcribePcm({required List<double> samples });
+
+
+/// Transcribe from a WAV file buffer (bytes).
+/// 
+/// Returns an error if the buffer is not a valid WAV file.
+ Future<String>  transcribeWavBuffer({required List<int> wavData });
+
+
+
+                    
+                }
+                
+
+/// Model information returned by [QwenAsrEngine.model_info].
+class ModelInfo  {
+                final String variant;
+final String modelType;
+final int encHidden;
+final int encLayers;
+final int decHidden;
+final int decLayers;
+
+                const ModelInfo({required this.variant ,required this.modelType ,required this.encHidden ,required this.encLayers ,required this.decHidden ,required this.decLayers ,});
+
+                
+                
+
+                
+        @override
+        int get hashCode => variant.hashCode^modelType.hashCode^encHidden.hashCode^encLayers.hashCode^decHidden.hashCode^decLayers.hashCode;
+        
+
+                
+        @override
+        bool operator ==(Object other) =>
+            identical(this, other) ||
+            other is ModelInfo &&
+                runtimeType == other.runtimeType
+                && variant == other.variant&& modelType == other.modelType&& encHidden == other.encHidden&& encLayers == other.encLayers&& decHidden == other.decHidden&& decLayers == other.decLayers;
+        
+            }
+            

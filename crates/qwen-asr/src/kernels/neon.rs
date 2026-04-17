@@ -695,7 +695,7 @@ pub unsafe fn quantize_bf16_to_int8(w_bf16: *const u16, out_dim: usize, in_dim: 
 
 /// SDOT via inline assembly (stable Rust, avoids unstable vdotq_s32)
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
+#[target_feature(enable = "dotprod")]
 unsafe fn sdot_s32(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
     core::arch::asm!(
         "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
@@ -713,6 +713,7 @@ unsafe fn sdot_s32(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t 
 /// # Safety
 /// Uses NEON SDOT via inline asm.
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
 pub unsafe fn matvec_int8(
     y: &mut [f32], x_int8: *const i8, x_scale: f32,
     w_int8: *const i8, w_scales: &[f32],

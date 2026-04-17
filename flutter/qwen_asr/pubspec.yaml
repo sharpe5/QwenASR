@@ -44,3 +44,9 @@ flutter:
       macos:
         pluginClass: QwenAsrPlugin
         ffiPlugin: true
+      windows:
+        pluginClass: QwenAsrPluginCApi
+        ffiPlugin: true
+      linux:
+        pluginClass: QwenAsrPlugin
+        ffiPlugin: true

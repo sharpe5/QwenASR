@@ -400,7 +400,7 @@ fn bf16_matvec_fused(y: &mut [f32], x: &[f32], w_bf16: *const u16, bias: Option<
     { unsafe { avx::bf16_matvec_fused(y, x, w_bf16, bias, in_dim, out_dim); } }
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    generic::bf16_matvec_fused(y, x, w_bf16, bias, in_dim, out_dim);
+    unsafe { generic::bf16_matvec_fused(y, x, w_bf16, bias, in_dim, out_dim); }
 }
 
 fn argmax_bf16_range(x: &[f32], w_bf16: *const u16, in_dim: usize, start: usize, end: usize) -> (usize, f32) {
@@ -411,7 +411,7 @@ fn argmax_bf16_range(x: &[f32], w_bf16: *const u16, in_dim: usize, start: usize,
     { unsafe { avx::argmax_bf16_range(x, w_bf16, in_dim, start, end) } }
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    generic::argmax_bf16_range(x, w_bf16, in_dim, start, end)
+    unsafe { generic::argmax_bf16_range(x, w_bf16, in_dim, start, end) }
 }
 
 #[inline]

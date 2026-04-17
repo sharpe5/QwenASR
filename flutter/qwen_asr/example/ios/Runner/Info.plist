@@ -45,5 +45,10 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	
+	<!-- Microphone permission description -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>This app needs microphone access to transcribe your speech in real-time.</string>
+	
 </dict>
 </plist>
