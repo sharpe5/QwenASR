@@ -22,6 +22,62 @@ const STREAM_RESET_INTERVAL_CHUNKS: i32 = 45;
 const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PrefillRowKey {
+    a: u64,
+    b: u64,
+}
+
+#[inline]
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
+#[inline]
+fn prefill_token_key(token: i32) -> PrefillRowKey {
+    let x = token as u32 as u64;
+    PrefillRowKey {
+        a: mix64(0x544f_4b45_4e00_0000 ^ x),
+        b: mix64(0x454d_4245_4400_0000 ^ x.rotate_left(17)),
+    }
+}
+
+fn prefill_embed_key(row: &[f32]) -> PrefillRowKey {
+    let mut a = 0xcbf29ce484222325u64;
+    let mut b = 0x9e3779b97f4a7c15u64 ^ row.len() as u64;
+    for &v in row {
+        let bits = v.to_bits() as u64;
+        a ^= bits;
+        a = a.wrapping_mul(0x100000001b3);
+        b ^= bits
+            .wrapping_add(0x9e3779b97f4a7c15)
+            .wrapping_add(b << 6)
+            .wrapping_add(b >> 2);
+    }
+    PrefillRowKey { a, b }
+}
+
+fn prefill_embed_keys(data: &[f32], seq_len: usize, dim: usize) -> Vec<PrefillRowKey> {
+    let mut keys = Vec::with_capacity(seq_len);
+    for i in 0..seq_len {
+        keys.push(prefill_embed_key(&data[i * dim..(i + 1) * dim]));
+    }
+    keys
+}
+
+fn prefill_lcp_len(prev: &[PrefillRowKey], current: &[PrefillRowKey], prefill_len: usize) -> usize {
+    let cmp_len = prefill_len.min(prev.len()).min(current.len());
+    let mut reused = 0usize;
+    while reused < cmp_len && prev[reused] == current[reused] {
+        reused += 1;
+    }
+    reused
+}
+
 fn get_time_ms() -> f64 {
     // Use monotonic clock
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -37,7 +93,9 @@ fn elapsed_ms(t0: f64) -> f64 {
 /// tokens repeats at the tail of `tokens`. Used for streaming degeneracy detection.
 fn stream_tail_repeat_blocks(tokens: &[i32], max_period: usize) -> (usize, usize) {
     let n = tokens.len();
-    if n < 2 { return (1, 0); }
+    if n < 2 {
+        return (1, 0);
+    }
     let period_cap = (n / 2).min(if max_period > 0 { max_period } else { n / 2 });
     let mut best_reps = 1usize;
     let mut best_period = 0usize;
@@ -82,7 +140,9 @@ fn transcribe_segment(
 
     // Encoder
     let t0 = get_time_ms();
-    let (enc_output, enc_seq_len) = ctx.encoder.forward(cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
+    let (enc_output, enc_seq_len) =
+        ctx.encoder
+            .forward(cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
     let enc_ms = elapsed_ms(t0);
 
     if kernels::verbose() >= 2 {
@@ -109,21 +169,42 @@ fn transcribe_segment(
     // Embed prefix head
     let mut off = 0;
     for &tok in PREFIX_HEAD {
-        unsafe { tok_embed_bf16_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok_emb, tok, dim) };
+        unsafe {
+            tok_embed_bf16_to_f32(
+                &mut input_embeds[off * dim..(off + 1) * dim],
+                tok_emb,
+                tok,
+                dim,
+            )
+        };
         off += 1;
     }
 
     // Optional prompt
     if let Some(ref ptoks) = ctx.prompt_tokens {
         for &tok in ptoks {
-            unsafe { tok_embed_bf16_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok_emb, tok, dim) };
+            unsafe {
+                tok_embed_bf16_to_f32(
+                    &mut input_embeds[off * dim..(off + 1) * dim],
+                    tok_emb,
+                    tok,
+                    dim,
+                )
+            };
             off += 1;
         }
     }
 
     // Prefix tail
     for &tok in PREFIX_TAIL {
-        unsafe { tok_embed_bf16_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok_emb, tok, dim) };
+        unsafe {
+            tok_embed_bf16_to_f32(
+                &mut input_embeds[off * dim..(off + 1) * dim],
+                tok_emb,
+                tok,
+                dim,
+            )
+        };
         off += 1;
     }
 
@@ -136,20 +217,28 @@ fn transcribe_segment(
     // Suffix base
     let suffix_off = prefix_len + enc_seq_len;
     for (i, &tok) in SUFFIX_BASE.iter().enumerate() {
-        unsafe { tok_embed_bf16_to_f32(
+        unsafe {
+            tok_embed_bf16_to_f32(
             &mut input_embeds[(suffix_off + i) * dim..(suffix_off + i + 1) * dim],
-            tok_emb, tok, dim,
-        ) };
+                tok_emb,
+                tok,
+                dim,
+            )
+        };
     }
 
     // Force language tokens
     if let Some(ref ftoks) = ctx.force_prompt_tokens {
         for (i, &tok) in ftoks.iter().enumerate() {
-            unsafe { tok_embed_bf16_to_f32(
+            unsafe {
+                tok_embed_bf16_to_f32(
                 &mut input_embeds[(suffix_off + SUFFIX_BASE.len() + i) * dim
                     ..(suffix_off + SUFFIX_BASE.len() + i + 1) * dim],
-                tok_emb, tok, dim,
-            ) };
+                    tok_emb,
+                    tok,
+                    dim,
+                )
+            };
         }
     }
 
@@ -157,15 +246,24 @@ fn transcribe_segment(
     let past_off = suffix_off + suffix_len;
     if let Some(ptoks) = past_tokens {
         for (i, &tok) in ptoks.iter().enumerate() {
-            unsafe { tok_embed_bf16_to_f32(
+            unsafe {
+                tok_embed_bf16_to_f32(
                 &mut input_embeds[(past_off + i) * dim..(past_off + i + 1) * dim],
-                tok_emb, tok, dim,
-            ) };
+                    tok_emb,
+                    tok,
+                    dim,
+                )
+            };
         }
-        unsafe { tok_embed_bf16_to_f32(
-            &mut input_embeds[(past_off + ptoks.len()) * dim..(past_off + ptoks.len() + 1) * dim],
-            tok_emb, TOKEN_ASR_TEXT, dim,
-        ) };
+        unsafe {
+            tok_embed_bf16_to_f32(
+                &mut input_embeds
+                    [(past_off + ptoks.len()) * dim..(past_off + ptoks.len() + 1) * dim],
+                tok_emb,
+                TOKEN_ASR_TEXT,
+                dim,
+            )
+        };
     }
 
     // Decoder prefill
@@ -173,15 +271,24 @@ fn transcribe_segment(
     ctx.kv_cache.len = 0;
     let prefill_len = total_seq - 1;
     decoder::decoder_prefill(
-        &ctx.decoder, cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-        &mut ctx.dec_bufs, &input_embeds, prefill_len,
+        &ctx.decoder,
+        cfg,
+        &mut ctx.kv_cache,
+        &mut ctx.rope_cache,
+        &mut ctx.dec_bufs,
+        &input_embeds,
+        prefill_len,
     );
 
     // First token from last prefill position
     let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
     let mut token = decoder::decoder_forward(
-        &ctx.decoder, cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-        &mut ctx.dec_bufs, last_embed,
+        &ctx.decoder,
+        cfg,
+        &mut ctx.kv_cache,
+        &mut ctx.rope_cache,
+        &mut ctx.dec_bufs,
+        last_embed,
     );
 
     let prefill_ms = elapsed_ms(t0);
@@ -216,12 +323,20 @@ fn transcribe_segment(
                 // For the callback, provide lossy UTF-8 for display purposes
                 cb(&String::from_utf8_lossy(piece_bytes));
             }
+
+            if n_text_tokens >= 40 && matches!(piece_bytes, b"." | b"!" | b"?") {
+                break;
+            }
         }
 
         unsafe { tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim) };
         token = decoder::decoder_forward(
-            &ctx.decoder, cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-            &mut ctx.dec_bufs, &tmp_embed,
+            &ctx.decoder,
+            cfg,
+            &mut ctx.kv_cache,
+            &mut ctx.rope_cache,
+            &mut ctx.dec_bufs,
+            &tmp_embed,
         );
     }
 
@@ -229,8 +344,13 @@ fn transcribe_segment(
     if kernels::verbose() >= 2 {
         eprintln!(
             "  Decode: {} tokens ({:.0} ms, {:.1} ms/token)",
-            n_generated, decode_ms,
-            if n_generated > 0 { decode_ms / n_generated as f64 } else { 0.0 }
+            n_generated,
+            decode_ms,
+            if n_generated > 0 {
+                decode_ms / n_generated as f64
+            } else {
+                0.0
+            }
         );
     }
 
@@ -278,10 +398,18 @@ fn find_split_point(samples: &[f32], target_sample: usize, search_sec: f32) -> u
 }
 
 fn should_insert_boundary_space(prev_ch: u8, next_ch: u8) -> bool {
-    if prev_ch == 0 || next_ch == 0 { return false; }
-    if (prev_ch as char).is_whitespace() { return false; }
-    if (next_ch as char).is_whitespace() { return false; }
-    if (next_ch as char).is_ascii_punctuation() { return false; }
+    if prev_ch == 0 || next_ch == 0 {
+        return false;
+    }
+    if (prev_ch as char).is_whitespace() {
+        return false;
+    }
+    if (next_ch as char).is_whitespace() {
+        return false;
+    }
+    if (next_ch as char).is_ascii_punctuation() {
+        return false;
+    }
     true
 }
 
@@ -304,7 +432,10 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             let used_pct = 100.0 * compacted.len() as f32 / samples.len().max(1) as f32;
             eprintln!(
                 "Silence skip: used {:.1}%, skipped {:.1}% ({} -> {} samples)",
-                used_pct, 100.0 - used_pct, samples.len(), compacted.len()
+                used_pct,
+                100.0 - used_pct,
+                samples.len(),
+                compacted.len()
             );
         }
         compacted
@@ -342,7 +473,9 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         let split = find_split_point(&audio_samples, pos + target_samples, search);
         splits.push(split);
         pos = split;
-        if splits.len() >= 127 { break; }
+        if splits.len() >= 127 {
+            break;
+        }
     }
     let n_splits = splits.len();
 
@@ -356,7 +489,11 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
     for s in 0..n_splits {
         let core_start = splits[s];
-        let core_end = if s + 1 < n_splits { splits[s + 1] } else { audio_samples.len() };
+        let core_end = if s + 1 < n_splits {
+            splits[s + 1]
+        } else {
+            audio_samples.len()
+        };
         let seg_start = core_start;
         let seg_end = core_end;
         let seg_samples = seg_end - seg_start;
@@ -364,7 +501,8 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         if kernels::verbose() >= 2 {
             eprintln!(
                 "Segment {}/{}: {:.1}-{:.1}s ({} samples)",
-                s + 1, n_splits,
+                s + 1,
+                n_splits,
                 seg_start as f32 / SAMPLE_RATE as f32,
                 seg_end as f32 / SAMPLE_RATE as f32,
                 seg_samples
@@ -389,14 +527,15 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             None
         };
 
-        let (seg_text, _seg_text_tokens) = match transcribe_segment(
-            ctx, seg_ptr, &tokenizer, past_tokens.as_deref(),
-        ) {
+        let (seg_text, _seg_text_tokens) =
+            match transcribe_segment(ctx, seg_ptr, &tokenizer, past_tokens.as_deref()) {
             Some(r) => r,
             None => continue,
         };
 
-        if seg_text.is_empty() { continue; }
+        if seg_text.is_empty() {
+            continue;
+        }
 
         let need_space = if !result.is_empty() {
             let prev = *result.as_bytes().last().unwrap_or(&0);
@@ -451,7 +590,11 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     let chunk_samples = (ctx.stream_chunk_sec * SAMPLE_RATE as f32) as usize;
     let rollback = ctx.stream_rollback;
     let unfixed_chunks = ctx.stream_unfixed_chunks;
-    let max_new_tokens = if ctx.stream_max_new_tokens > 0 { ctx.stream_max_new_tokens } else { 32 };
+    let max_new_tokens = if ctx.stream_max_new_tokens > 0 {
+        ctx.stream_max_new_tokens
+    } else {
+        32
+    };
 
     let audio_samples = if ctx.skip_silence {
         audio::compact_silence(samples)
@@ -495,13 +638,13 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     struct EncWindow {
         seq_len: usize,
         enc_output: Vec<f32>,
+        row_keys: Vec<PrefillRowKey>,
     }
     let mut enc_cache: Vec<EncWindow> = Vec::new();
     let mut enc_cached_seq_total = 0usize;
 
-    // Previous prefill embeddings for LCP reuse
-    let mut prev_prefill_embeds: Vec<f32> = Vec::new();
-    let mut prev_prefill_len = 0usize;
+    // Previous prefill row keys for LCP reuse
+    let mut prev_prefill_keys: Vec<PrefillRowKey> = Vec::new();
 
     // Streaming robustness state
     let mut stale_count = 0i32;
@@ -520,20 +663,35 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         // Cache completed windows (base offset accounts for windows cleared on re-anchor)
         while (enc_cache_base_windows + enc_cache.len()) * enc_window_samples < full_end {
             let ws = (enc_cache_base_windows + enc_cache.len()) * enc_window_samples;
-            let (mel, mel_frames) = audio::mel_spectrogram(&audio_samples[ws..ws + enc_window_samples])?;
-            let (win_enc, win_seq) = ctx.encoder.forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
+            let (mel, mel_frames) =
+                audio::mel_spectrogram(&audio_samples[ws..ws + enc_window_samples])?;
+            let (win_enc, win_seq) =
+                ctx.encoder
+                    .forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
+            let row_keys = prefill_embed_keys(&win_enc, win_seq, dim);
             enc_cached_seq_total += win_seq;
-            enc_cache.push(EncWindow { seq_len: win_seq, enc_output: win_enc });
+            enc_cache.push(EncWindow {
+                seq_len: win_seq,
+                enc_output: win_enc,
+                row_keys,
+            });
         }
 
         // Encode partial tail
         let mut partial_seq = 0;
         let mut partial_enc: Vec<f32> = Vec::new();
+        let mut partial_keys: Vec<PrefillRowKey> = Vec::new();
         if full_end < audio_cursor {
             let _partial_samples = audio_cursor - full_end;
-            if let Some((mel, mel_frames)) = audio::mel_spectrogram(&audio_samples[full_end..audio_cursor]) {
-                if let Some((enc, seq)) = ctx.encoder.forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs)) {
+            if let Some((mel, mel_frames)) =
+                audio::mel_spectrogram(&audio_samples[full_end..audio_cursor])
+            {
+                if let Some((enc, seq)) =
+                    ctx.encoder
+                        .forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))
+                {
                     partial_seq = seq;
+                    partial_keys = prefill_embed_keys(&enc, seq, dim);
                     partial_enc = enc;
                 }
             }
@@ -545,24 +703,14 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             continue;
         }
 
-        // Assemble encoder output
-        let mut enc_output = vec![0.0f32; enc_seq_len * dim];
-        let mut enc_off = 0;
-        for w in &enc_cache {
-            enc_output[enc_off * dim..(enc_off + w.seq_len) * dim]
-                .copy_from_slice(&w.enc_output);
-            enc_off += w.seq_len;
-        }
-        if partial_seq > 0 {
-            enc_output[enc_off * dim..(enc_off + partial_seq) * dim]
-                .copy_from_slice(&partial_enc);
-        }
-
         let enc_ms = elapsed_ms(t0);
         ctx.perf_encode_ms += enc_ms;
 
         // Prefix rollback
-        let n_prefix_tokens = if ctx.past_text_conditioning && chunk_idx >= unfixed_chunks && !raw_tokens.is_empty() {
+        let n_prefix_tokens = if ctx.past_text_conditioning
+            && chunk_idx >= unfixed_chunks
+            && !raw_tokens.is_empty()
+        {
             (raw_tokens.len() as i32 - rollback).max(0) as usize
         } else {
             0
@@ -576,74 +724,128 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         let total_seq = prefix_len + enc_seq_len + suffix_len + n_prefix_tokens;
 
         let mut input_embeds = vec![0.0f32; total_seq * dim];
+        let mut prefill_keys = vec![PrefillRowKey { a: 0, b: 0 }; total_seq];
         let mut off = 0;
 
         for &tok in PREFIX_HEAD {
-            unsafe { tok_embed_bf16_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok_emb, tok, dim) };
+            unsafe {
+                tok_embed_bf16_to_f32(
+                    &mut input_embeds[off * dim..(off + 1) * dim],
+                    tok_emb,
+                    tok,
+                    dim,
+                )
+            };
+            prefill_keys[off] = prefill_token_key(tok);
             off += 1;
         }
         if let Some(ref ptoks) = ctx.prompt_tokens {
             for &tok in ptoks {
-                unsafe { tok_embed_bf16_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok_emb, tok, dim) };
+                unsafe {
+                    tok_embed_bf16_to_f32(
+                        &mut input_embeds[off * dim..(off + 1) * dim],
+                        tok_emb,
+                        tok,
+                        dim,
+                    )
+                };
+                prefill_keys[off] = prefill_token_key(tok);
                 off += 1;
             }
         }
         for &tok in PREFIX_TAIL {
-            unsafe { tok_embed_bf16_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok_emb, tok, dim) };
+            unsafe {
+                tok_embed_bf16_to_f32(
+                    &mut input_embeds[off * dim..(off + 1) * dim],
+                    tok_emb,
+                    tok,
+                    dim,
+                )
+            };
+            prefill_keys[off] = prefill_token_key(tok);
             off += 1;
         }
 
-        for i in 0..enc_seq_len {
-            input_embeds[(prefix_len + i) * dim..(prefix_len + i + 1) * dim]
-                .copy_from_slice(&enc_output[i * dim..(i + 1) * dim]);
+        let mut enc_key_off = 0;
+        for w in &enc_cache {
+            prefill_keys[prefix_len + enc_key_off..prefix_len + enc_key_off + w.seq_len]
+                .copy_from_slice(&w.row_keys);
+            enc_key_off += w.seq_len;
+        }
+        if partial_seq > 0 {
+            prefill_keys[prefix_len + enc_key_off..prefix_len + enc_key_off + partial_seq]
+                .copy_from_slice(&partial_keys);
+        }
+
+        let mut enc_embed_off = 0;
+        for w in &enc_cache {
+            let n = w.seq_len * dim;
+            input_embeds
+                [(prefix_len + enc_embed_off) * dim..(prefix_len + enc_embed_off) * dim + n]
+                .copy_from_slice(&w.enc_output);
+            enc_embed_off += w.seq_len;
+        }
+        if partial_seq > 0 {
+            let n = partial_seq * dim;
+            input_embeds
+                [(prefix_len + enc_embed_off) * dim..(prefix_len + enc_embed_off) * dim + n]
+                .copy_from_slice(&partial_enc);
         }
 
         let suffix_off = prefix_len + enc_seq_len;
         for (i, &tok) in SUFFIX_BASE.iter().enumerate() {
-            unsafe { tok_embed_bf16_to_f32(
+            unsafe {
+                tok_embed_bf16_to_f32(
                 &mut input_embeds[(suffix_off + i) * dim..(suffix_off + i + 1) * dim],
-                tok_emb, tok, dim,
-            ) };
+                    tok_emb,
+                    tok,
+                    dim,
+                )
+            };
+            prefill_keys[suffix_off + i] = prefill_token_key(tok);
         }
         if let Some(ref ftoks) = ctx.force_prompt_tokens {
             for (i, &tok) in ftoks.iter().enumerate() {
-                unsafe { tok_embed_bf16_to_f32(
+                unsafe {
+                    tok_embed_bf16_to_f32(
                     &mut input_embeds[(suffix_off + SUFFIX_BASE.len() + i) * dim
                         ..(suffix_off + SUFFIX_BASE.len() + i + 1) * dim],
-                    tok_emb, tok, dim,
-                ) };
+                        tok_emb,
+                        tok,
+                        dim,
+                    )
+                };
+                prefill_keys[suffix_off + SUFFIX_BASE.len() + i] = prefill_token_key(tok);
             }
         }
 
         let text_off = suffix_off + suffix_len;
         for i in 0..n_prefix_tokens {
-            unsafe { tok_embed_bf16_to_f32(
+            unsafe {
+                tok_embed_bf16_to_f32(
                 &mut input_embeds[(text_off + i) * dim..(text_off + i + 1) * dim],
-                tok_emb, raw_tokens[i], dim,
-            ) };
+                    tok_emb,
+                    raw_tokens[i],
+                    dim,
+                )
+            };
+            prefill_keys[text_off + i] = prefill_token_key(raw_tokens[i]);
         }
 
         // Decoder prefill with LCP reuse
         let t0 = get_time_ms();
         let prefill_len = total_seq - 1;
 
-        let mut reused_prefill = 0;
-        if !prev_prefill_embeds.is_empty() && prev_prefill_len > 0 {
-            let cmp_len = prefill_len.min(prev_prefill_len);
-            let _row_bytes = dim * std::mem::size_of::<f32>();
-            while reused_prefill < cmp_len {
-                let a = &prev_prefill_embeds[reused_prefill * dim..(reused_prefill + 1) * dim];
-                let b = &input_embeds[reused_prefill * dim..(reused_prefill + 1) * dim];
-                if a != b { break; }
-                reused_prefill += 1;
-            }
-        }
+        let reused_prefill = prefill_lcp_len(&prev_prefill_keys, &prefill_keys, prefill_len);
 
         ctx.kv_cache.len = reused_prefill;
         let delta_prefill = prefill_len - reused_prefill;
         if delta_prefill > 0 {
             decoder::decoder_prefill(
-                &ctx.decoder, &cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
+                &ctx.decoder,
+                &cfg,
+                &mut ctx.kv_cache,
+                &mut ctx.rope_cache,
                 &mut ctx.dec_bufs,
                 &input_embeds[reused_prefill * dim..],
                 delta_prefill,
@@ -652,13 +854,17 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
         let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
         let mut token = decoder::decoder_forward(
-            &ctx.decoder, &cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-            &mut ctx.dec_bufs, last_embed,
+            &ctx.decoder,
+            &cfg,
+            &mut ctx.kv_cache,
+            &mut ctx.rope_cache,
+            &mut ctx.dec_bufs,
+            last_embed,
         );
 
         // Save for next chunk
-        prev_prefill_embeds = input_embeds[..prefill_len * dim].to_vec();
-        prev_prefill_len = prefill_len;
+        prev_prefill_keys.clear();
+        prev_prefill_keys.extend_from_slice(&prefill_keys[..prefill_len]);
 
         let prefill_ms = elapsed_ms(t0);
         ctx.perf_decode_ms += prefill_ms;
@@ -670,12 +876,20 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
         while n_generated < max_new_tokens {
             n_generated += 1;
-            if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END { break; }
+            if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END {
+                break;
+            }
             chunk_tokens.push(token);
-            unsafe { tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim); }
+            unsafe {
+                tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim);
+            }
             token = decoder::decoder_forward(
-                &ctx.decoder, &cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-                &mut ctx.dec_bufs, &tmp_embed,
+                &ctx.decoder,
+                &cfg,
+                &mut ctx.kv_cache,
+                &mut ctx.rope_cache,
+                &mut ctx.dec_bufs,
+                &tmp_embed,
             );
         }
 
@@ -694,13 +908,14 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             prev_tail_snapshot = raw_tokens.clone();
         }
         let (best_reps, _) = stream_tail_repeat_blocks(&raw_tokens, STREAM_DEGEN_MAX_PERIOD);
-        let is_degen = stale_count >= STREAM_STALE_CHUNKS
-            || best_reps >= STREAM_DEGEN_MIN_REPEATS;
+        let is_degen = stale_count >= STREAM_STALE_CHUNKS || best_reps >= STREAM_DEGEN_MIN_REPEATS;
 
         if is_degen {
             if kernels::verbose() >= 2 {
-                eprintln!("[stream degen] reset at chunk {} (stale={}, reps={})",
-                    chunk_idx, stale_count, best_reps);
+                eprintln!(
+                    "[stream degen] reset at chunk {} (stale={}, reps={})",
+                    chunk_idx, stale_count, best_reps
+                );
             }
             let carry = stable_text_tokens.len().min(STREAM_RESET_CARRY_TOKENS);
             let carry_start = stable_text_tokens.len() - carry;
@@ -709,8 +924,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
                 raw_tokens.push(TOKEN_ASR_TEXT);
                 raw_tokens.extend_from_slice(&stable_text_tokens[carry_start..]);
             }
-            prev_prefill_embeds.clear();
-            prev_prefill_len = 0;
+            prev_prefill_keys.clear();
             stale_count = 0;
             prev_tail_snapshot.clear();
         }
@@ -727,8 +941,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
                 raw_tokens.push(TOKEN_ASR_TEXT);
                 raw_tokens.extend_from_slice(&stable_text_tokens[carry_start..]);
             }
-            prev_prefill_embeds.clear();
-            prev_prefill_len = 0;
+            prev_prefill_keys.clear();
             stale_count = 0;
             prev_tail_snapshot.clear();
             enc_cache_base_windows += enc_cache.len();
@@ -738,7 +951,9 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
         // Parse text region
         let text_start = if n_force_prompt_tokens == 0 {
-            raw_tokens.iter().position(|&t| t == TOKEN_ASR_TEXT)
+            raw_tokens
+                .iter()
+                .position(|&t| t == TOKEN_ASR_TEXT)
                 .map(|p| p + 1)
                 .unwrap_or(0)
         } else {
@@ -757,7 +972,9 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
         // Monotonic commit
         let candidate_tokens = &raw_tokens[text_start..];
-        let _lcp = stable_text_tokens.iter().zip(candidate_tokens.iter())
+        let _lcp = stable_text_tokens
+            .iter()
+            .zip(candidate_tokens.iter())
             .take_while(|(a, b)| a == b)
             .count();
 
@@ -791,13 +1008,14 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 struct EncWindow {
     seq_len: usize,
     enc_output: Vec<f32>,
+    row_keys: Vec<PrefillRowKey>,
 }
 
 /// Persistent state for incremental streaming transcription.
 ///
 /// Create once, then call [`stream_push_audio`] each time new audio
 /// arrives.  The state keeps encoder caches, token history, and decoder
-/// prefill embeddings so that only *new* work is performed per call.
+/// prefill row keys so that only *new* work is performed per call.
 pub struct StreamState {
     // Encoder
     enc_cache: Vec<EncWindow>,
@@ -810,8 +1028,7 @@ pub struct StreamState {
     result_bytes: Vec<u8>,
 
     // Prefill LCP reuse
-    prev_prefill_embeds: Vec<f32>,
-    prev_prefill_len: usize,
+    prev_prefill_keys: Vec<PrefillRowKey>,
 
     // Streaming robustness
     prev_tail_snapshot: Vec<i32>,
@@ -820,6 +1037,7 @@ pub struct StreamState {
     // Lazy partial encoding: skip re-encoding every other chunk
     last_partial_cursor: usize,
     last_partial_enc: Vec<f32>,
+    last_partial_keys: Vec<PrefillRowKey>,
     last_partial_seq: usize,
 
     // Audio cursor
@@ -847,12 +1065,12 @@ impl StreamState {
             raw_tokens: Vec::new(),
             stable_text_tokens: Vec::new(),
             result_bytes: Vec::new(),
-            prev_prefill_embeds: Vec::new(),
-            prev_prefill_len: 0,
+            prev_prefill_keys: Vec::new(),
             prev_tail_snapshot: Vec::new(),
             stale_count: 0,
             last_partial_cursor: 0,
             last_partial_enc: Vec::new(),
+            last_partial_keys: Vec::new(),
             last_partial_seq: 0,
             audio_cursor: 0,
             chunk_idx: 0,
@@ -869,12 +1087,12 @@ impl StreamState {
         self.raw_tokens.clear();
         self.stable_text_tokens.clear();
         self.result_bytes.clear();
-        self.prev_prefill_embeds.clear();
-        self.prev_prefill_len = 0;
+        self.prev_prefill_keys.clear();
         self.prev_tail_snapshot.clear();
         self.stale_count = 0;
         self.last_partial_cursor = 0;
         self.last_partial_enc.clear();
+        self.last_partial_keys.clear();
         self.last_partial_seq = 0;
         self.audio_cursor = 0;
         self.chunk_idx = 0;
@@ -910,7 +1128,11 @@ pub fn stream_push_audio(
     let chunk_samples = (ctx.stream_chunk_sec * SAMPLE_RATE as f32) as usize;
     let rollback = ctx.stream_rollback;
     let unfixed_chunks = ctx.stream_unfixed_chunks;
-    let max_new_tokens = if ctx.stream_max_new_tokens > 0 { ctx.stream_max_new_tokens } else { 32 };
+    let max_new_tokens = if ctx.stream_max_new_tokens > 0 {
+        ctx.stream_max_new_tokens
+    } else {
+        32
+    };
 
     // Lazy-init tokenizer
     if state.tokenizer.is_none() {
@@ -956,12 +1178,20 @@ pub fn stream_push_audio(
     let full_end = (state.audio_cursor / enc_window_samples) * enc_window_samples;
 
     // Cache newly completed windows (base offset accounts for windows cleared on re-anchor)
-    while (state.enc_cache_base_windows + state.enc_cache.len()) * enc_window_samples < full_end {
+        while (state.enc_cache_base_windows + state.enc_cache.len()) * enc_window_samples < full_end
+        {
         let ws = (state.enc_cache_base_windows + state.enc_cache.len()) * enc_window_samples;
         let (mel, mel_frames) = audio::mel_spectrogram(&samples[ws..ws + enc_window_samples])?;
-        let (win_enc, win_seq) = ctx.encoder.forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
+            let (win_enc, win_seq) =
+                ctx.encoder
+                    .forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
+            let row_keys = prefill_embed_keys(&win_enc, win_seq, dim);
         state.enc_cached_seq_total += win_seq;
-        state.enc_cache.push(EncWindow { seq_len: win_seq, enc_output: win_enc });
+            state.enc_cache.push(EncWindow {
+                seq_len: win_seq,
+                enc_output: win_enc,
+                row_keys,
+            });
     }
 
     // Encode partial tail — with lazy re-encoding for LCP optimization.
@@ -970,54 +1200,52 @@ pub fn stream_push_audio(
     // encoder output gives near-perfect LCP matching, cutting prefill cost.
     let enc_update_threshold = chunk_samples * 2;
     let partial_age = state.audio_cursor.saturating_sub(state.last_partial_cursor);
-    let need_encode = state.last_partial_cursor == 0
-        || partial_age >= enc_update_threshold
-        || is_final;
+        let need_encode =
+            state.last_partial_cursor == 0 || partial_age >= enc_update_threshold || is_final;
 
     let partial_seq;
     let partial_enc;
+        let partial_keys;
     if need_encode && full_end < state.audio_cursor {
-        if let Some((mel, mel_frames)) = audio::mel_spectrogram(&samples[full_end..state.audio_cursor]) {
-            if let Some((enc, seq)) = ctx.encoder.forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs)) {
+            if let Some((mel, mel_frames)) =
+                audio::mel_spectrogram(&samples[full_end..state.audio_cursor])
+            {
+                if let Some((enc, seq)) =
+                    ctx.encoder
+                        .forward(&cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))
+                {
                 partial_seq = seq;
+                    partial_keys = prefill_embed_keys(&enc, seq, dim);
                 partial_enc = enc;
                 state.last_partial_cursor = state.audio_cursor;
                 state.last_partial_enc = partial_enc.clone();
+                    state.last_partial_keys = partial_keys.clone();
                 state.last_partial_seq = partial_seq;
             } else {
                 partial_seq = state.last_partial_seq;
                 partial_enc = state.last_partial_enc.clone();
+                    partial_keys = state.last_partial_keys.clone();
             }
         } else {
             partial_seq = state.last_partial_seq;
             partial_enc = state.last_partial_enc.clone();
+                partial_keys = state.last_partial_keys.clone();
         }
     } else if full_end < state.audio_cursor {
         // Reuse previous partial encoding (skip chunk)
         partial_seq = state.last_partial_seq;
         partial_enc = state.last_partial_enc.clone();
+            partial_keys = state.last_partial_keys.clone();
     } else {
         partial_seq = 0;
         partial_enc = Vec::new();
+            partial_keys = Vec::new();
     }
 
     let enc_seq_len = state.enc_cached_seq_total + partial_seq;
     if enc_seq_len == 0 {
         state.chunk_idx += 1;
         return Some(String::new());
-    }
-
-    // Assemble encoder output (cached windows + partial)
-    let mut enc_output = vec![0.0f32; enc_seq_len * dim];
-    let mut enc_off = 0;
-    for w in &state.enc_cache {
-        enc_output[enc_off * dim..(enc_off + w.seq_len) * dim]
-            .copy_from_slice(&w.enc_output);
-        enc_off += w.seq_len;
-    }
-    if partial_seq > 0 {
-        enc_output[enc_off * dim..(enc_off + partial_seq) * dim]
-            .copy_from_slice(&partial_enc);
     }
 
     let enc_ms = elapsed_ms(t0);
@@ -1041,73 +1269,128 @@ pub fn stream_push_audio(
     let total_seq = prefix_len + enc_seq_len + suffix_len + n_prefix_tokens;
 
     let mut input_embeds = vec![0.0f32; total_seq * dim];
+        let mut prefill_keys = vec![PrefillRowKey { a: 0, b: 0 }; total_seq];
     let mut off = 0;
 
     for &tok in PREFIX_HEAD {
-        unsafe { tok_embed_bf16_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok_emb, tok, dim); }
+            unsafe {
+                tok_embed_bf16_to_f32(
+                    &mut input_embeds[off * dim..(off + 1) * dim],
+                    tok_emb,
+                    tok,
+                    dim,
+                );
+            }
+            prefill_keys[off] = prefill_token_key(tok);
         off += 1;
     }
     if let Some(ref ptoks) = ctx.prompt_tokens {
         for &tok in ptoks {
-            unsafe { tok_embed_bf16_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok_emb, tok, dim); }
+                unsafe {
+                    tok_embed_bf16_to_f32(
+                        &mut input_embeds[off * dim..(off + 1) * dim],
+                        tok_emb,
+                        tok,
+                        dim,
+                    );
+                }
+                prefill_keys[off] = prefill_token_key(tok);
             off += 1;
         }
     }
     for &tok in PREFIX_TAIL {
-        unsafe { tok_embed_bf16_to_f32(&mut input_embeds[off * dim..(off + 1) * dim], tok_emb, tok, dim); }
+            unsafe {
+                tok_embed_bf16_to_f32(
+                    &mut input_embeds[off * dim..(off + 1) * dim],
+                    tok_emb,
+                    tok,
+                    dim,
+                );
+            }
+            prefill_keys[off] = prefill_token_key(tok);
         off += 1;
     }
 
-    for i in 0..enc_seq_len {
-        input_embeds[(prefix_len + i) * dim..(prefix_len + i + 1) * dim]
-            .copy_from_slice(&enc_output[i * dim..(i + 1) * dim]);
+        let mut enc_key_off = 0;
+        for w in &state.enc_cache {
+            prefill_keys[prefix_len + enc_key_off..prefix_len + enc_key_off + w.seq_len]
+                .copy_from_slice(&w.row_keys);
+            enc_key_off += w.seq_len;
+        }
+        if partial_seq > 0 {
+            prefill_keys[prefix_len + enc_key_off..prefix_len + enc_key_off + partial_seq]
+                .copy_from_slice(&partial_keys);
+        }
+
+        let mut enc_embed_off = 0;
+        for w in &state.enc_cache {
+            let n = w.seq_len * dim;
+            input_embeds
+                [(prefix_len + enc_embed_off) * dim..(prefix_len + enc_embed_off) * dim + n]
+                .copy_from_slice(&w.enc_output);
+            enc_embed_off += w.seq_len;
+        }
+        if partial_seq > 0 {
+            let n = partial_seq * dim;
+            input_embeds
+                [(prefix_len + enc_embed_off) * dim..(prefix_len + enc_embed_off) * dim + n]
+                .copy_from_slice(&partial_enc);
     }
 
     let suffix_off = prefix_len + enc_seq_len;
     for (i, &tok) in SUFFIX_BASE.iter().enumerate() {
-        unsafe { tok_embed_bf16_to_f32(
+            unsafe {
+                tok_embed_bf16_to_f32(
             &mut input_embeds[(suffix_off + i) * dim..(suffix_off + i + 1) * dim],
-            tok_emb, tok, dim,
-        ); }
+                    tok_emb,
+                    tok,
+                    dim,
+                );
+            }
+            prefill_keys[suffix_off + i] = prefill_token_key(tok);
     }
     if let Some(ref ftoks) = ctx.force_prompt_tokens {
         for (i, &tok) in ftoks.iter().enumerate() {
-            unsafe { tok_embed_bf16_to_f32(
+                unsafe {
+                    tok_embed_bf16_to_f32(
                 &mut input_embeds[(suffix_off + SUFFIX_BASE.len() + i) * dim
                     ..(suffix_off + SUFFIX_BASE.len() + i + 1) * dim],
-                tok_emb, tok, dim,
-            ); }
+                        tok_emb,
+                        tok,
+                        dim,
+                    );
+                }
+                prefill_keys[suffix_off + SUFFIX_BASE.len() + i] = prefill_token_key(tok);
         }
     }
 
     let text_off = suffix_off + suffix_len;
     for i in 0..n_prefix_tokens {
-        unsafe { tok_embed_bf16_to_f32(
+            unsafe {
+                tok_embed_bf16_to_f32(
             &mut input_embeds[(text_off + i) * dim..(text_off + i + 1) * dim],
-            tok_emb, state.raw_tokens[i], dim,
-        ); }
+                    tok_emb,
+                    state.raw_tokens[i],
+                    dim,
+                );
+            }
+            prefill_keys[text_off + i] = prefill_token_key(state.raw_tokens[i]);
     }
 
     // ---- Decoder prefill with LCP reuse ----
     let t0 = get_time_ms();
     let prefill_len = total_seq - 1;
 
-    let mut reused_prefill = 0;
-    if !state.prev_prefill_embeds.is_empty() && state.prev_prefill_len > 0 {
-        let cmp_len = prefill_len.min(state.prev_prefill_len);
-        while reused_prefill < cmp_len {
-            let a = &state.prev_prefill_embeds[reused_prefill * dim..(reused_prefill + 1) * dim];
-            let b = &input_embeds[reused_prefill * dim..(reused_prefill + 1) * dim];
-            if a != b { break; }
-            reused_prefill += 1;
-        }
-    }
+        let reused_prefill = prefill_lcp_len(&state.prev_prefill_keys, &prefill_keys, prefill_len);
 
     ctx.kv_cache.len = reused_prefill;
     let delta_prefill = prefill_len - reused_prefill;
     if delta_prefill > 0 {
         decoder::decoder_prefill(
-            &ctx.decoder, &cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
+                &ctx.decoder,
+                &cfg,
+                &mut ctx.kv_cache,
+                &mut ctx.rope_cache,
             &mut ctx.dec_bufs,
             &input_embeds[reused_prefill * dim..],
             delta_prefill,
@@ -1116,13 +1399,19 @@ pub fn stream_push_audio(
 
     let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
     let mut token = decoder::decoder_forward(
-        &ctx.decoder, &cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-        &mut ctx.dec_bufs, last_embed,
+            &ctx.decoder,
+            &cfg,
+            &mut ctx.kv_cache,
+            &mut ctx.rope_cache,
+            &mut ctx.dec_bufs,
+            last_embed,
     );
 
     // Save for next chunk
-    state.prev_prefill_embeds = input_embeds[..prefill_len * dim].to_vec();
-    state.prev_prefill_len = prefill_len;
+        state.prev_prefill_keys.clear();
+        state
+            .prev_prefill_keys
+            .extend_from_slice(&prefill_keys[..prefill_len]);
 
     let prefill_ms = elapsed_ms(t0);
     ctx.perf_decode_ms += prefill_ms;
@@ -1141,12 +1430,20 @@ pub fn stream_push_audio(
 
     while n_generated < max_new_tokens {
         n_generated += 1;
-        if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END { break; }
+            if token == TOKEN_ENDOFTEXT || token == TOKEN_IM_END {
+                break;
+            }
         chunk_tokens.push(token);
-        unsafe { tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim); }
+            unsafe {
+                tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim);
+            }
         token = decoder::decoder_forward(
-            &ctx.decoder, &cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
-            &mut ctx.dec_bufs, &tmp_embed,
+                &ctx.decoder,
+                &cfg,
+                &mut ctx.kv_cache,
+                &mut ctx.rope_cache,
+                &mut ctx.dec_bufs,
+                &tmp_embed,
         );
     }
 
@@ -1164,7 +1461,10 @@ pub fn stream_push_audio(
     if speech_ended {
         // Emit remaining rollback tokens from current raw_tokens (before truncation)
         let text_start = if n_force_prompt_tokens == 0 {
-            state.raw_tokens.iter().position(|&t| t == TOKEN_ASR_TEXT)
+                state
+                    .raw_tokens
+                    .iter()
+                    .position(|&t| t == TOKEN_ASR_TEXT)
                 .map(|p| p + 1)
                 .unwrap_or(0)
         } else {
@@ -1201,24 +1501,31 @@ pub fn stream_push_audio(
             state.stale_count = 0;
             state.prev_tail_snapshot = state.raw_tokens.clone();
         }
-        let (best_reps, _) = stream_tail_repeat_blocks(&state.raw_tokens, STREAM_DEGEN_MAX_PERIOD);
-        let is_degen = state.stale_count >= STREAM_STALE_CHUNKS
-            || best_reps >= STREAM_DEGEN_MIN_REPEATS;
+            let (best_reps, _) =
+                stream_tail_repeat_blocks(&state.raw_tokens, STREAM_DEGEN_MAX_PERIOD);
+            let is_degen =
+                state.stale_count >= STREAM_STALE_CHUNKS || best_reps >= STREAM_DEGEN_MIN_REPEATS;
 
         if is_degen {
             if kernels::verbose() >= 2 {
-                eprintln!("[stream degen] reset at chunk {} (stale={}, reps={})",
-                    state.chunk_idx, state.stale_count, best_reps);
+                    eprintln!(
+                        "[stream degen] reset at chunk {} (stale={}, reps={})",
+                        state.chunk_idx, state.stale_count, best_reps
+                    );
             }
-            let carry = state.stable_text_tokens.len().min(STREAM_RESET_CARRY_TOKENS);
+                let carry = state
+                    .stable_text_tokens
+                    .len()
+                    .min(STREAM_RESET_CARRY_TOKENS);
             let carry_start = state.stable_text_tokens.len() - carry;
             state.raw_tokens.clear();
             if carry > 0 {
                 state.raw_tokens.push(TOKEN_ASR_TEXT);
-                state.raw_tokens.extend_from_slice(&state.stable_text_tokens[carry_start..]);
+                    state
+                        .raw_tokens
+                        .extend_from_slice(&state.stable_text_tokens[carry_start..]);
             }
-            state.prev_prefill_embeds.clear();
-            state.prev_prefill_len = 0;
+                state.prev_prefill_keys.clear();
             state.stale_count = 0;
             state.prev_tail_snapshot.clear();
             if state.enc_cache.len() >= STREAM_MAX_ENC_WINDOWS {
@@ -1233,15 +1540,19 @@ pub fn stream_push_audio(
             if kernels::verbose() >= 2 {
                 eprintln!("[stream reanchor] at chunk {}", state.chunk_idx);
             }
-            let carry = state.stable_text_tokens.len().min(STREAM_RESET_CARRY_TOKENS);
+                let carry = state
+                    .stable_text_tokens
+                    .len()
+                    .min(STREAM_RESET_CARRY_TOKENS);
             let carry_start = state.stable_text_tokens.len() - carry;
             state.raw_tokens.clear();
             if carry > 0 {
                 state.raw_tokens.push(TOKEN_ASR_TEXT);
-                state.raw_tokens.extend_from_slice(&state.stable_text_tokens[carry_start..]);
+                    state
+                        .raw_tokens
+                        .extend_from_slice(&state.stable_text_tokens[carry_start..]);
             }
-            state.prev_prefill_embeds.clear();
-            state.prev_prefill_len = 0;
+                state.prev_prefill_keys.clear();
             state.stale_count = 0;
             state.prev_tail_snapshot.clear();
             if state.enc_cache.len() >= STREAM_MAX_ENC_WINDOWS {
@@ -1255,7 +1566,10 @@ pub fn stream_push_audio(
     // ---- Parse text region and emit stable tokens (non-speech-ended case) ----
     if !speech_ended {
         let text_start = if n_force_prompt_tokens == 0 {
-            state.raw_tokens.iter().position(|&t| t == TOKEN_ASR_TEXT)
+                state
+                    .raw_tokens
+                    .iter()
+                    .position(|&t| t == TOKEN_ASR_TEXT)
                 .map(|p| p + 1)
                 .unwrap_or(0)
         } else {

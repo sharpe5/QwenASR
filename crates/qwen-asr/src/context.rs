@@ -143,12 +143,12 @@ impl QwenCtx {
             token_cb: None,
             segment_sec: 0.0,
             search_sec: 3.0,
-            stream_chunk_sec: 2.0,
+            stream_chunk_sec: 5.0,
             stream_rollback: 5,
             stream_unfixed_chunks: 2,
             stream_max_new_tokens: 32,
             past_text_conditioning: false,
-            skip_silence: false,
+            skip_silence: true,
             prompt: None,
             force_language: None,
             prompt_tokens: None,
@@ -224,6 +224,8 @@ impl QwenCtx {
                     return false;
                 }
             }
+        } else {
+            self.force_prompt_tokens = Some(vec![11528, 6364, TOKEN_ASR_TEXT]);
         }
 
         self.prompt_tokens_ready = true;

@@ -806,8 +806,71 @@ pub unsafe fn argmax_int8_range(
 ) -> (usize, f32) {
     let mut best = start;
     let mut best_val = -1e30f32;
+    let mut o = start;
 
-    for o in start..end {
+    while o + 1 < end {
+        let w0 = w_int8.add(o * in_dim);
+        let w1 = w_int8.add((o + 1) * in_dim);
+        let mut acc0a = vdupq_n_s32(0);
+        let mut acc0b = vdupq_n_s32(0);
+        let mut acc0c = vdupq_n_s32(0);
+        let mut acc0d = vdupq_n_s32(0);
+        let mut acc1a = vdupq_n_s32(0);
+        let mut acc1b = vdupq_n_s32(0);
+        let mut acc1c = vdupq_n_s32(0);
+        let mut acc1d = vdupq_n_s32(0);
+        let mut k = 0;
+
+        while k + 64 <= in_dim {
+            let x0 = vld1q_s8(x_int8.add(k));
+            let x1 = vld1q_s8(x_int8.add(k + 16));
+            let x2 = vld1q_s8(x_int8.add(k + 32));
+            let x3 = vld1q_s8(x_int8.add(k + 48));
+            acc0a = sdot_s32(acc0a, x0, vld1q_s8(w0.add(k)));
+            acc0b = sdot_s32(acc0b, x1, vld1q_s8(w0.add(k + 16)));
+            acc0c = sdot_s32(acc0c, x2, vld1q_s8(w0.add(k + 32)));
+            acc0d = sdot_s32(acc0d, x3, vld1q_s8(w0.add(k + 48)));
+            acc1a = sdot_s32(acc1a, x0, vld1q_s8(w1.add(k)));
+            acc1b = sdot_s32(acc1b, x1, vld1q_s8(w1.add(k + 16)));
+            acc1c = sdot_s32(acc1c, x2, vld1q_s8(w1.add(k + 32)));
+            acc1d = sdot_s32(acc1d, x3, vld1q_s8(w1.add(k + 48)));
+            k += 64;
+        }
+
+        while k + 16 <= in_dim {
+            let xv = vld1q_s8(x_int8.add(k));
+            acc0a = sdot_s32(acc0a, xv, vld1q_s8(w0.add(k)));
+            acc1a = sdot_s32(acc1a, xv, vld1q_s8(w1.add(k)));
+            k += 16;
+        }
+
+        let sum0_i32 = vaddvq_s32(vaddq_s32(vaddq_s32(acc0a, acc0c), vaddq_s32(acc0b, acc0d)));
+        let sum1_i32 = vaddvq_s32(vaddq_s32(vaddq_s32(acc1a, acc1c), vaddq_s32(acc1b, acc1d)));
+
+        let mut tail0 = 0i32;
+        let mut tail1 = 0i32;
+        while k < in_dim {
+            let xv = *x_int8.add(k) as i32;
+            tail0 += xv * (*w0.add(k) as i32);
+            tail1 += xv * (*w1.add(k) as i32);
+            k += 1;
+        }
+
+        let val0 = (sum0_i32 + tail0) as f32 * x_scale * w_scales[o];
+        let val1 = (sum1_i32 + tail1) as f32 * x_scale * w_scales[o + 1];
+
+        if val0 > best_val {
+            best_val = val0;
+            best = o;
+        }
+        if val1 > best_val {
+            best_val = val1;
+            best = o + 1;
+        }
+        o += 2;
+    }
+
+    while o < end {
         let w_row = w_int8.add(o * in_dim);
         let mut acc0 = vdupq_n_s32(0);
         let mut acc1 = vdupq_n_s32(0);
@@ -843,6 +906,7 @@ pub unsafe fn argmax_int8_range(
             best_val = val;
             best = o;
         }
+        o += 1;
     }
 
     (best, best_val)

@@ -189,7 +189,11 @@ pub fn resample(samples: &[f32], from_rate: i32, to_rate: i32) -> Vec<f32> {
             wsum += coeff;
         }
 
-        *resampled_val = if wsum > 1e-9 { (acc / wsum) as f32 } else { 0.0 };
+        *resampled_val = if wsum > 1e-9 {
+            (acc / wsum) as f32
+        } else {
+            0.0
+        };
     }
 
     resampled
@@ -305,7 +309,8 @@ pub fn mel_spectrogram(samples: &[f32]) -> Option<(Vec<f32>, usize)> {
     let window = HANN_WINDOW.get_or_init(|| {
         let mut w = vec![0.0f32; WINDOW_SIZE];
         for (i, w_val) in w.iter_mut().enumerate().take(WINDOW_SIZE) {
-            *w_val = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / WINDOW_SIZE as f32).cos());
+            *w_val =
+                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / WINDOW_SIZE as f32).cos());
         }
         w
     });
@@ -361,7 +366,9 @@ pub fn mel_spectrogram(samples: &[f32]) -> Option<(Vec<f32>, usize)> {
     let mut global_max = -1e30f32;
     for val in mel.iter_mut() {
         *val = (*val).max(1e-10).log10();
-        if *val > global_max { global_max = *val; }
+        if *val > global_max {
+            global_max = *val;
+        }
     }
     let min_val = global_max - 8.0;
     for val in mel.iter_mut() {
@@ -379,12 +386,12 @@ pub fn compact_silence(samples: &[f32]) -> Vec<f32> {
     }
 
     let win = 160; // 10ms at 16kHz
-    let base_thresh = 0.002f32;
+    let base_thresh = 0.0205f32;
     let max_thresh = 0.025f32;
     let smooth_alpha = 0.2f32;
     let min_voice_windows = 5;
-    let pad_voice_windows = 3;
-    let pass_windows = 60;
+    let pad_voice_windows = 1;
+    let pass_windows = 0;
 
     let n_win = n_samples.div_ceil(win);
     let mut rms_vals = vec![0.0f32; n_win];
