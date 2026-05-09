@@ -582,7 +582,8 @@ pub fn decoder_forward(
     for (layer_idx, layer) in decoder.layers.iter().enumerate() {
         kernels::rms_norm(&mut bufs.x_norm[..dim], &bufs.x[..dim], &layer.input_norm, 1, dim, eps);
 
-        // INT8 fused QKV projection
+        // INT8 fused QKV projection (aarch64 only, BF16 fallback on x86_64)
+        #[cfg(target_arch = "aarch64")]
         kernels::linear_nobias_int8_qkv(
             &mut bufs.q[..q_dim], &mut bufs.k[..kv_dim], &mut bufs.v[..kv_dim],
             &bufs.x_norm[..dim],
@@ -591,6 +592,12 @@ pub fn decoder_forward(
             &layer.wv_int8, &layer.wv_int8_scales,
             dim, q_dim, kv_dim,
         );
+        #[cfg(not(target_arch = "aarch64"))]
+        unsafe {
+            kernels::linear_nobias_bf16(&mut bufs.q[..q_dim], &bufs.x_norm[..dim], layer.wq_weight_bf16, 1, dim, q_dim);
+            kernels::linear_nobias_bf16(&mut bufs.k[..kv_dim], &bufs.x_norm[..dim], layer.wk_weight_bf16, 1, dim, kv_dim);
+            kernels::linear_nobias_bf16(&mut bufs.v[..kv_dim], &bufs.x_norm[..dim], layer.wv_weight_bf16, 1, dim, kv_dim);
+        }
 
         kernels::rms_norm_per_head(&mut bufs.q[..q_dim], &layer.q_norm_weight, 1, n_heads, head_dim, eps);
         kernels::rms_norm_per_head(&mut bufs.k[..kv_dim], &layer.k_norm_weight, 1, n_kv_heads, head_dim, eps);
@@ -612,20 +619,34 @@ pub fn decoder_forward(
                                  1, total_seq, n_heads, n_kv_heads,
                                  head_dim, scale, pos);
 
-        // INT8 O-projection with fused residual add: x += attn_out @ wo
+        // O-projection with fused residual add: x += attn_out @ wo (INT8 on aarch64, BF16 on x86_64)
+        #[cfg(target_arch = "aarch64")]
         kernels::linear_nobias_int8_addto(&mut bufs.x[..dim], &bufs.attn_out[..q_dim],
                                           &layer.wo_int8, &layer.wo_int8_scales, q_dim, dim);
+        #[cfg(not(target_arch = "aarch64"))]
+        kernels::linear_nobias_bf16_addto(&mut bufs.x[..dim], &bufs.attn_out[..q_dim],
+                                          layer.wo_weight_bf16, q_dim, dim);
 
         kernels::rms_norm(&mut bufs.x_norm[..dim], &bufs.x[..dim], &layer.post_attn_norm, 1, dim, eps);
 
-        // INT8 gate_up + SwiGLU
+        // gate_up + SwiGLU (INT8 on aarch64, BF16 on x86_64)
+        #[cfg(target_arch = "aarch64")]
         kernels::linear_nobias_int8_swiglu(
             &mut bufs.ffn_out[..intermediate], &bufs.x_norm[..dim],
             &layer.gate_up_int8, &layer.gate_up_int8_scales, dim, intermediate,
         );
-        // INT8 down-projection with fused residual add: x += ffn_out @ down
+        #[cfg(not(target_arch = "aarch64"))]
+        kernels::linear_nobias_bf16_swiglu(
+            &mut bufs.ffn_out[..intermediate], &bufs.x_norm[..dim],
+            layer.gate_up_fused_bf16.as_ptr(), dim, intermediate,
+        );
+        // down-projection with fused residual add: x += ffn_out @ down (INT8 on aarch64, BF16 on x86_64)
+        #[cfg(target_arch = "aarch64")]
         kernels::linear_nobias_int8_addto(&mut bufs.x[..dim], &bufs.ffn_out[..intermediate],
                                           &layer.down_int8, &layer.down_int8_scales, intermediate, dim);
+        #[cfg(not(target_arch = "aarch64"))]
+        kernels::linear_nobias_bf16_addto(&mut bufs.x[..dim], &bufs.ffn_out[..intermediate],
+                                          layer.down_weight_bf16, intermediate, dim);
     }
 
     kv_cache.len = pos + 1;
@@ -635,7 +656,8 @@ pub fn decoder_forward(
     bufs.x[..dim].copy_from_slice(&bufs.x_norm[..dim]);
     let lm_out_dim = cfg.lm_head_dim();
 
-    // Use INT8 quantized argmax if available (2x less bandwidth)
+    // Use INT8 quantized argmax on aarch64 (2x less bandwidth), BF16 on x86_64
+    #[cfg(target_arch = "aarch64")]
     if let (Some(ref int8_data), Some(ref scales)) = (&decoder.lm_head_int8, &decoder.lm_head_int8_scales) {
         return kernels::argmax_matvec_int8(&bufs.x[..dim], int8_data, scales, dim, lm_out_dim) as i32;
     }
