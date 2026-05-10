@@ -2,6 +2,9 @@
 
 CLI for [qwen-asr](https://crates.io/crates/qwen-asr): CPU-only Qwen3-ASR speech-to-text in pure Rust.
 
+Current benchmark results are published in the repository README and compare the
+CLI's Rust CPU backend with upstream C and MLX-based GPU baselines.
+
 ## Install
 
 ```bash

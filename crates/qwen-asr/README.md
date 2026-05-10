@@ -4,6 +4,9 @@ CPU-only Qwen3-ASR speech recognition in pure Rust. No Python, no ONNX runtime,
 no framework dependencies — just `libc` and BLAS. BF16 weights stay memory-mapped
 for minimal RAM usage; SIMD kernels (NEON / AVX2+FMA) accelerate inference.
 
+Current benchmark results are published in the repository README and compare the
+Rust CPU implementation with upstream C and MLX-based GPU baselines.
+
 ## Prerequisites
 
 - Rust 1.70+
