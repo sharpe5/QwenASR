@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/huanglizhuo/QwenASR/compare/qwen-asr-cli-v0.6.0...qwen-asr-cli-v0.7.0) (2026-05-10)
+
+
+### Features
+
+* document benchmarked ASR performance ([f3b33a0](https://github.com/huanglizhuo/QwenASR/commit/f3b33a0863c815fedbdac18650e2b673af53efbe))
+
 ## [0.6.0](https://github.com/huanglizhuo/QwenASR/compare/qwen-asr-cli-v0.5.0...qwen-asr-cli-v0.6.0) (2026-03-21)
 
 
