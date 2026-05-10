@@ -4,7 +4,11 @@
 /bench/results/
 /bench/compare-results/
 /bench/.venv-bench/
+/bench/.venv-mlx-audio/
 /bench/__pycache__/
+/tmp/qwen3_asr_rs/
+/bench/run_mlx_audio.py
+/bench/generate_unified_charts.py
 /qwen3-aligner-0.6b
 /tmp/
 

@@ -12,7 +12,8 @@ LABEL=""
 OUTPUT_DIR="$SCRIPT_DIR/results"
 MODES="offline,segmented,streaming"
 THREADS=""
-RUNS=1
+RUNS=10
+PROFILE=0
 
 usage() {
     cat >&2 <<EOF
@@ -25,7 +26,8 @@ Usage: bench/run.sh [options]
   --output-dir DIR    Where to save results (default: bench/results)
   --modes LIST        Comma-separated: offline,segmented,streaming (default: all)
   --threads N         Thread count (default: system CPUs)
-  --runs N            Repeat each test N times, take best (lowest latency) (default: 1)
+  --runs N            Repeat each test N times, use median latency (default: 10)
+  --profile           Enable kernel profile counters during measured runs
   -h, --help          Show this help
 EOF
     exit 1
@@ -41,6 +43,7 @@ while [[ $# -gt 0 ]]; do
         --modes)      MODES="$2"; shift 2;;
         --threads)    THREADS="$2"; shift 2;;
         --runs)       RUNS="$2"; shift 2;;
+        --profile)    PROFILE=1; shift;;
         -h|--help)    usage;;
         *)            echo "Unknown option: $1" >&2; usage;;
     esac
@@ -134,7 +137,10 @@ for wav in "${WAV_FILES[@]}"; do
         echo "[$DONE/$TOTAL] $base / $mode"
 
         # Build command
-        CMD=("$BINARY" -d "$MODEL_DIR" -i "$wav" --profile)
+        CMD=("$BINARY" -d "$MODEL_DIR" -i "$wav")
+        if [[ "$PROFILE" -eq 1 ]]; then
+            CMD+=(--profile)
+        fi
         if [[ -n "$THREAD_FLAG" ]]; then
             CMD+=($THREAD_FLAG)
         fi
@@ -147,16 +153,28 @@ for wav in "${WAV_FILES[@]}"; do
             *)          echo "  Unknown mode: $mode, skipping" >&2; continue;;
         esac
 
-        # Run (possibly multiple times)
-        BEST_TOTAL_MS=""
-        BEST_STDOUT=""
-        BEST_STDERR=""
+        # Run (possibly multiple times). Keep median inference run as the representative result.
+        RUNS_TSV="$(mktemp)"
 
         for run_i in $(seq 1 "$RUNS"); do
             STDOUT_FILE="$(mktemp)"
             STDERR_FILE="$(mktemp)"
 
-            if ! "${CMD[@]}" >"$STDOUT_FILE" 2>"$STDERR_FILE"; then
+            timing_line="$(python3 - "$STDOUT_FILE" "$STDERR_FILE" "${CMD[@]}" <<'PY'
+import subprocess, sys, time
+stdout_file, stderr_file = sys.argv[1:3]
+cmd = sys.argv[3:]
+with open(stdout_file, "wb") as so, open(stderr_file, "wb") as se:
+    t0 = time.perf_counter()
+    proc = subprocess.run(cmd, stdout=so, stderr=se)
+    t1 = time.perf_counter()
+print(f"rc={proc.returncode} wall_ms={(t1 - t0) * 1000:.1f}")
+PY
+)"
+            rc="$(echo "$timing_line" | sed -n 's/.*rc=\([0-9]*\).*/\1/p')"
+            this_wall="$(echo "$timing_line" | sed -n 's/.*wall_ms=\([0-9.]*\).*/\1/p')"
+
+            if [[ "$rc" != "0" ]]; then
                 echo "  FAILED (run $run_i)" >&2
                 rm -f "$STDOUT_FILE" "$STDERR_FILE"
                 continue
@@ -165,29 +183,58 @@ for wav in "${WAV_FILES[@]}"; do
             # Parse timing
             this_total=$(bash "$SCRIPT_DIR/parse_stderr.sh" < "$STDERR_FILE" | grep '^total_ms=' | head -1 | cut -d= -f2 || true)
 
-            # Keep best (lowest total_ms) run
-            keep=false
-            if [[ -z "$BEST_TOTAL_MS" ]]; then
-                keep=true
-            elif [[ -n "$this_total" ]] && awk "BEGIN{exit !($this_total < $BEST_TOTAL_MS)}" 2>/dev/null; then
-                keep=true
-            fi
-
-            if $keep; then
-                BEST_TOTAL_MS="$this_total"
-                if [[ -n "$BEST_STDOUT" ]]; then rm -f "$BEST_STDOUT"; fi
-                if [[ -n "$BEST_STDERR" ]]; then rm -f "$BEST_STDERR"; fi
-                BEST_STDOUT="$STDOUT_FILE"
-                BEST_STDERR="$STDERR_FILE"
-            else
+            if [[ -z "$this_total" ]]; then
                 rm -f "$STDOUT_FILE" "$STDERR_FILE"
+            else
+                printf '%s\t%s\t%s\t%s\t%s\n' "$run_i" "$this_total" "$this_wall" "$STDOUT_FILE" "$STDERR_FILE" >>"$RUNS_TSV"
             fi
         done
 
-        if [[ -z "$BEST_STDOUT" ]]; then
+        if [[ ! -s "$RUNS_TSV" ]]; then
             echo "  All runs failed, skipping" >&2
+            rm -f "$RUNS_TSV"
             continue
         fi
+
+        STATS_JSON="$(python3 - "$RUNS_TSV" <<'PY'
+import json, statistics, sys
+
+rows = []
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    for line in fh:
+        run_i, total_ms, wall_ms, stdout_file, stderr_file = line.rstrip("\n").split("\t")
+        rows.append({
+            "run": int(run_i),
+            "total_ms": float(total_ms),
+            "wall_ms": float(wall_ms),
+            "stdout": stdout_file,
+            "stderr": stderr_file,
+        })
+
+rows.sort(key=lambda row: row["total_ms"])
+median_total = statistics.median(row["total_ms"] for row in rows)
+median_wall = statistics.median(row["wall_ms"] for row in rows)
+median_row = min(rows, key=lambda row: (abs(row["total_ms"] - median_total), row["total_ms"]))
+payload = {
+    "median_run": median_row,
+    "inference": {
+        "median_ms": median_total,
+        "mean_ms": statistics.fmean(row["total_ms"] for row in rows),
+        "best_ms": rows[0]["total_ms"],
+    },
+    "wall": {
+        "median_ms": median_wall,
+        "mean_ms": statistics.fmean(row["wall_ms"] for row in rows),
+        "best_ms": min(row["wall_ms"] for row in rows),
+    },
+    "runs": [{"run": row["run"], "total_ms": row["total_ms"], "wall_ms": row["wall_ms"]} for row in rows],
+}
+print(json.dumps(payload))
+PY
+)"
+        BEST_STDOUT="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["median_run"]["stdout"])' "$STATS_JSON")"
+        BEST_STDERR="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["median_run"]["stderr"])' "$STATS_JSON")"
+        BEST_WALL_MS="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["wall"]["median_ms"])' "$STATS_JSON")"
 
         TRANSCRIPT="$(cat "$BEST_STDOUT")"
 
@@ -209,6 +256,7 @@ for wav in "${WAV_FILES[@]}"; do
         tokens_per_sec="${tokens_per_sec:-0}"
         audio_duration_s="${audio_duration_s:-0}"
         realtime_factor="${realtime_factor:-0}"
+        wall_ms="${BEST_WALL_MS:-0}"
 
         # Profile ops → JSON object
         PROFILE_JSON="{"
@@ -262,7 +310,8 @@ data = {
     'audio_duration_s': float(sys.argv[10]),
     'transcript': sys.argv[11],
     'reference': sys.argv[12],
-    'timing': {
+        'timing': {
+        'wall_ms': float(sys.argv[26]),
         'total_ms': float(sys.argv[13]),
         'encode_ms': float(sys.argv[14]),
         'decode_ms': float(sys.argv[15]),
@@ -289,10 +338,35 @@ with open(sys.argv[25], 'w', encoding='utf-8') as f:
             "$total_ms" "$encode_ms" "$decode_ms" "$tokens" "$tokens_per_sec" "$realtime_factor" \
             "$PROFILE_JSON" \
             "$WER" "$CER" "$LEV_WORDS" "$LEV_CHARS" "$EXACT" \
-            "$OUT_FILE"
+            "$OUT_FILE" "$wall_ms"
 
-        echo "  -> $OUT_FILE (${total_ms}ms, ${realtime_factor}x)"
-        rm -f "$BEST_STDOUT" "$BEST_STDERR"
+        python3 - "$OUT_FILE" "$STATS_JSON" <<'PY'
+import json, sys
+
+path, stats_json = sys.argv[1:]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+stats = json.loads(stats_json)
+data["timing"]["statistic"] = "median"
+data["timing"]["total_ms"] = round(stats["inference"]["median_ms"], 3)
+data["timing"]["wall_ms"] = round(stats["wall"]["median_ms"], 3)
+data["timing"]["realtime_factor"] = round(data["audio_duration_s"] / (stats["inference"]["median_ms"] / 1000.0), 3)
+data["timing"]["inference_mean_ms"] = round(stats["inference"]["mean_ms"], 3)
+data["timing"]["inference_best_ms"] = round(stats["inference"]["best_ms"], 3)
+data["timing"]["wall_mean_ms"] = round(stats["wall"]["mean_ms"], 3)
+data["timing"]["wall_best_ms"] = round(stats["wall"]["best_ms"], 3)
+data["timing"]["runs"] = stats["runs"]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+PY
+
+        echo "  -> $OUT_FILE (${wall_ms}ms median wall, ${total_ms}ms median inference, ${realtime_factor}x inference)"
+        while IFS=$'\t' read -r _ _ _ stdout_path stderr_path; do
+            if [[ "$stdout_path" != "$BEST_STDOUT" ]]; then rm -f "$stdout_path"; fi
+            if [[ "$stderr_path" != "$BEST_STDERR" ]]; then rm -f "$stderr_path"; fi
+        done < "$RUNS_TSV"
+        rm -f "$BEST_STDOUT" "$BEST_STDERR" "$RUNS_TSV"
     done
 done
 

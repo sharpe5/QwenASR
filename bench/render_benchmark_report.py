@@ -15,9 +15,11 @@ import matplotlib.pyplot as plt
 
 
 COLORS = {
-    "rust-before": "#4C78A8",
+    "rust-original": "#4C78A8",
     "rust-current": "#F58518",
     "c-antirez": "#54A24B",
+    "second-state-mlx": "#B279A2",
+    "mlx-audio": "#E45756",
 }
 
 
@@ -73,13 +75,24 @@ def pick_result(items: list[dict], impl: str, accelerate: bool, mode: str = "off
 
 def chart_rows_from_summary(items: list[dict], baseline_ref: str, current_ref: str) -> list[dict]:
     mapping = [
-        ("rust-before", f"before auto research\n{baseline_ref}"),
-        ("rust-current", f"after auto research\n{current_ref}"),
+        ("rust-original", f"qwen-asr first\n{baseline_ref}"),
+        ("rust-current", f"qwen-asr latest\n{current_ref}"),
         ("c-antirez", "pure C\nupstream"),
+        ("second-state-mlx", "second-state\nMLX GPU"),
+        ("mlx-audio", "mlx-audio\nPython MLX"),
     ]
     rows = []
     for impl, label in mapping:
-        item = pick_result(items, impl, True, "offline")
+        item = next(
+            (
+                candidate
+                for candidate in items
+                if candidate.get("impl") == impl
+                and candidate.get("mode") == "offline"
+                and candidate.get("run_ok")
+            ),
+            None,
+        )
         if not item or not item.get("run_ok"):
             continue
         rows.append(
@@ -88,6 +101,12 @@ def chart_rows_from_summary(items: list[dict], baseline_ref: str, current_ref: s
                 "label": label,
                 "total_ms": float(item["total_ms"]),
                 "realtime_factor": float(item["realtime_factor"]),
+                "inference_mean_ms": float(item["inference_mean_ms"]) if item.get("inference_mean_ms") is not None else None,
+                "inference_best_ms": float(item["inference_best_ms"]) if item.get("inference_best_ms") is not None else None,
+                "wall_clock_ms": float(item["wall_clock_ms"]) if item.get("wall_clock_ms") is not None else None,
+                "wall_clock_realtime_factor": float(item["wall_clock_realtime_factor"]) if item.get("wall_clock_realtime_factor") is not None else None,
+                "wall_clock_mean_ms": float(item["wall_clock_mean_ms"]) if item.get("wall_clock_mean_ms") is not None else None,
+                "wall_clock_best_ms": float(item["wall_clock_best_ms"]) if item.get("wall_clock_best_ms") is not None else None,
                 "commit": item.get("commit"),
             }
         )
@@ -109,6 +128,12 @@ def nice_upper_bound(values: list[float]) -> float:
     else:
         nice = 10
     return nice * magnitude
+
+
+def fmt_ms(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:,.0f}" if value >= 100 else f"{value:.2f}"
 
 
 def render_bar_chart(rows: list[dict], metric: str, ylabel: str, title: str, subtitle: str, output_path: Path) -> None:
@@ -162,43 +187,47 @@ def build_markdown_report(
     modes: str,
     system_info: dict[str, str],
 ) -> str:
-    accel_rows = chart_rows_from_summary(summary_items, baseline_ref, current_ref)
-    accel_by_impl = {row["impl"]: row for row in accel_rows}
+    rows = chart_rows_from_summary(summary_items, baseline_ref, current_ref)
+    by_impl = {row["impl"]: row for row in rows}
 
-    for impl in ("rust-before", "rust-current", "c-antirez"):
-        if impl not in accel_by_impl:
-            raise SystemExit(f"Missing Accelerate result for '{impl}' — expected all three implementations to succeed")
+    required = ("rust-original", "rust-current", "c-antirez", "second-state-mlx", "mlx-audio")
+    for impl in required:
+        if impl not in by_impl:
+            raise SystemExit(f"Missing benchmark result for '{impl}'")
 
-    accel_before = accel_by_impl["rust-before"]
-    accel_current = accel_by_impl["rust-current"]
-    accel_c = accel_by_impl["c-antirez"]
-
-    accel_table = [
-        ("before auto research", baseline_ref, accel_before["total_ms"], accel_before["realtime_factor"]),
-        ("after auto research", current_ref, accel_current["total_ms"], accel_current["realtime_factor"]),
-        ("pure C upstream", "-", accel_c["total_ms"], accel_c["realtime_factor"]),
+    table = [
+        ("qwen-asr (first)", baseline_ref, by_impl["rust-original"]),
+        ("qwen-asr (latest)", current_ref, by_impl["rust-current"]),
+        ("pure C upstream", by_impl["c-antirez"].get("commit") or "-", by_impl["c-antirez"]),
+        ("second-state MLX GPU", by_impl["second-state-mlx"].get("commit") or "-", by_impl["second-state-mlx"]),
+        ("mlx-audio Python MLX", by_impl["mlx-audio"].get("commit") or "-", by_impl["mlx-audio"]),
     ]
 
-    before_ms = accel_before["total_ms"]
-    after_ms = accel_current["total_ms"]
-    c_ms = accel_c["total_ms"]
-    speedup_vs_before = before_ms / after_ms
-    speedup_vs_c = c_ms / after_ms
+    latest_ms = by_impl["rust-current"]["total_ms"]
+    original_ms = by_impl["rust-original"]["total_ms"]
+    c_ms = by_impl["c-antirez"]["total_ms"]
+    second_state_ms = by_impl["second-state-mlx"]["total_ms"]
+    mlx_audio_ms = by_impl["mlx-audio"]["total_ms"]
 
-    accel_latency_rel = os.path.relpath(chart_dir / "benchmark-accelerate-latency.png", report_dir)
-    accel_rtf_rel = os.path.relpath(chart_dir / "benchmark-accelerate-rtf.png", report_dir)
+    unified_latency_rel = os.path.relpath(chart_dir / "benchmark-unified-latency.png", report_dir)
+    unified_rtf_rel = os.path.relpath(chart_dir / "benchmark-unified-rtf.png", report_dir)
 
     lines: list[str] = []
     lines.append("# Benchmark Report")
     lines.append("")
     lines.append("## Methodology")
     lines.append("")
-    lines.append("- Offline benchmark on the same input WAV and model across three implementations.")
-    lines.append(f"- Rust baseline: `before auto research {baseline_ref}`.")
-    lines.append(f"- Rust optimized: `after auto research {current_ref}`.")
-    lines.append("- Upstream baseline: `antirez/qwen-asr` pure C implementation.")
-    lines.append("- macOS Accelerate enabled.")
-    lines.append(f"- Runs per target: `{runs}`.")
+    lines.append("- Offline benchmark on the same input WAV and model across five implementations.")
+    lines.append(f"- qwen-asr first: `{baseline_ref}`.")
+    lines.append(f"- qwen-asr latest: `{current_ref}`.")
+    lines.append("- Upstream C: `antirez/qwen-asr`.")
+    lines.append("- GPU baselines: `second-state/qwen3_asr_rs` MLX and `mlx-audio` Python MLX.")
+    lines.append("- Implementations are benchmarked sequentially, not in parallel; each round is a standalone process invocation.")
+    lines.append("- Primary metric is median inference time across standalone rounds for every implementation.")
+    lines.append("- qwen-asr and pure C use their internal inference timers. MLX-based implementations are timed after model load with explicit GPU synchronization.")
+    lines.append("- macOS Accelerate enabled for qwen-asr and pure C where applicable.")
+    lines.append("- Wall-clock time is retained as a secondary metric.")
+    lines.append(f"- Standalone rounds per target: `{runs}`.")
     lines.append(f"- Modes requested: `{modes}`.")
     lines.append("")
     lines.append("## Environment")
@@ -214,21 +243,44 @@ def build_markdown_report(
     lines.append("")
     lines.append("## Results")
     lines.append("")
-    lines.append("| Implementation | Commit | Total ms | RTF |")
-    lines.append("|---|---:|---:|---:|")
-    for label, commit, total_ms, rtf in accel_table:
+    lines.append("| Implementation | Commit | Median inference ms | Mean ms | Best ms | RTF |")
+    lines.append("|---|---:|---:|---:|---:|---:|")
+    for label, commit, row in table:
         commit_text = f"`{commit}`" if commit != "-" else "-"
-        total_text = f"{total_ms:,.0f}" if total_ms >= 100 else f"{total_ms:.2f}"
-        lines.append(f"| {label} | {commit_text} | `{total_text}` | `{rtf:.2f}x` |")
+        total_ms = row["total_ms"]
+        rtf = row["realtime_factor"]
+        total_text = fmt_ms(total_ms)
+        mean_text = fmt_ms(row.get("inference_mean_ms"))
+        best_text = fmt_ms(row.get("inference_best_ms"))
+        lines.append(f"| {label} | {commit_text} | `{total_text}` | `{mean_text}` | `{best_text}` | `{rtf:.2f}x` |")
     lines.append("")
-    lines.append(f"![Accelerate latency]({accel_latency_rel})")
+    lines.append("<details>")
+    lines.append("<summary>Wall-clock timing</summary>")
     lines.append("")
-    lines.append(f"![Accelerate realtime factor]({accel_rtf_rel})")
+    lines.append("| Implementation | Commit | Median wall-clock ms | Mean ms | Best ms | Wall-clock RTF |")
+    lines.append("|---|---:|---:|---:|---:|---:|")
+    for label, commit, row in table:
+        commit_text = f"`{commit}`" if commit != "-" else "-"
+        wall_ms = row.get("wall_clock_ms")
+        wall_rtf = row.get("wall_clock_realtime_factor")
+        wall_text = fmt_ms(wall_ms)
+        wall_mean_text = fmt_ms(row.get("wall_clock_mean_ms"))
+        wall_best_text = fmt_ms(row.get("wall_clock_best_ms"))
+        wall_rtf_text = "N/A" if wall_rtf is None else f"{wall_rtf:.2f}x"
+        lines.append(f"| {label} | {commit_text} | `{wall_text}` | `{wall_mean_text}` | `{wall_best_text}` | `{wall_rtf_text}` |")
+    lines.append("")
+    lines.append("</details>")
+    lines.append("")
+    lines.append(f"![Unified latency]({unified_latency_rel})")
+    lines.append("")
+    lines.append(f"![Unified realtime factor]({unified_rtf_rel})")
     lines.append("")
     lines.append("## Findings")
     lines.append("")
-    lines.append(f"- With Accelerate enabled, `after auto research {current_ref}` is `{speedup_vs_before:.2f}x` faster than `before auto research {baseline_ref}`.")
-    lines.append(f"- With Accelerate enabled, `after auto research {current_ref}` is `{speedup_vs_c:.2f}x` faster than the upstream pure C implementation.")
+    lines.append(f"- qwen-asr latest `{current_ref}` is `{original_ms / latest_ms:.2f}x` the speed of qwen-asr first `{baseline_ref}`.")
+    lines.append(f"- qwen-asr latest `{current_ref}` is `{c_ms / latest_ms:.2f}x` faster than the upstream pure C implementation.")
+    lines.append(f"- qwen-asr latest `{current_ref}` is `{second_state_ms / latest_ms:.2f}x` faster than second-state MLX GPU by inference latency.")
+    lines.append(f"- qwen-asr latest `{current_ref}` is `{mlx_audio_ms / latest_ms:.2f}x` faster than mlx-audio Python MLX by inference latency.")
     lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -256,27 +308,27 @@ def main() -> None:
     summary_items = load_json(summary_path)
     system_info = load_system_info(Path(args.system_info) if args.system_info else None)
 
-    accel_rows = chart_rows_from_summary(summary_items, args.baseline_ref, args.current_ref)
-    accel_impls = {row["impl"] for row in accel_rows}
-    missing = {"rust-before", "rust-current", "c-antirez"} - accel_impls
+    rows = chart_rows_from_summary(summary_items, args.baseline_ref, args.current_ref)
+    impls = {row["impl"] for row in rows}
+    missing = {"rust-original", "rust-current", "c-antirez", "second-state-mlx", "mlx-audio"} - impls
     if missing:
-        raise SystemExit(f"Missing Accelerate results for: {', '.join(sorted(missing))}. Got: {', '.join(sorted(accel_impls))}")
+        raise SystemExit(f"Missing benchmark results for: {', '.join(sorted(missing))}. Got: {', '.join(sorted(impls))}")
 
     render_bar_chart(
-        accel_rows,
+        rows,
         "total_ms",
         "Latency (ms)",
         "Offline ASR Benchmark on macOS",
-        "Accelerate enabled, lower is better",
-        charts_dir / "benchmark-accelerate-latency.png",
+        "Median inference time, lower is better",
+        charts_dir / "benchmark-unified-latency.png",
     )
     render_bar_chart(
-        accel_rows,
+        rows,
         "realtime_factor",
         "Realtime Factor (x)",
         "Offline ASR Benchmark on macOS",
-        "Accelerate enabled, higher is better",
-        charts_dir / "benchmark-accelerate-rtf.png",
+        "Higher is better",
+        charts_dir / "benchmark-unified-rtf.png",
     )
 
     report_path.parent.mkdir(parents=True, exist_ok=True)

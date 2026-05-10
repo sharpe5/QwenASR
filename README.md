@@ -11,22 +11,54 @@ Performance optimizations were discovered autonomously using the [autoresearch](
 
 ## Benchmark
 
-Offline benchmark on macOS (Apple M5, Accelerate enabled, 3 runs best-of, 28.2s audio):
+Offline ASR benchmark on macOS (Apple M5, 10 standalone rounds, 28.2s audio). Implementations are benchmarked sequentially, not in parallel. The primary metric is median inference time, so model loading and process startup do not dominate comparisons.
 
-| Implementation | Commit | Total ms | Realtime Factor |
-|---|---:|---:|---:|
-| before auto research | `bf52daf` | 1,747 | 16.12x |
-| after auto research | `80947fb` | 636 | 44.30x |
-| pure C upstream | [`b00b789`](https://github.com/antirez/qwen-asr/commit/b00b789) | 1,801 | 15.63x |
+| Implementation | Commit | Median inference ms | Mean ms | Best ms | RTF |
+|---|---:|---:|---:|---:|---:|
+| qwen-asr (first) | [`bf52daf`](https://github.com/huanglizhuo/QwenASR/commit/bf52daf) | 1,842 | 1,853 | 1,820 | 15.31x |
+| qwen-asr (latest) | [`0f5f065`](https://github.com/huanglizhuo/QwenASR/commit/0f5f065) | 676 | 678 | 668 | 41.69x |
+| pure C upstream | [`b00b789`](https://github.com/antirez/qwen-asr/commit/b00b789) | 1,885 | 1,885 | 1,861 | 14.94x |
+| second-state MLX GPU | [`3fa6734`](https://github.com/second-state/qwen3_asr_rs/commit/3fa6734) | 2,785 | 2,808 | 2,745 | 10.11x |
+| mlx-audio Python MLX | [`0.4.3`](https://github.com/Blaizzy/mlx-audio) | 801 | 820 | 788 | 35.16x |
 
-![Latency](bench/charts/benchmark-accelerate-latency.png)
+qwen-asr and pure C use internal inference timers. MLX-based implementations are timed after model load with explicit GPU synchronization. Wall-clock time is still recorded for diagnostics and end-to-end command cost.
 
-![Realtime factor](bench/charts/benchmark-accelerate-rtf.png)
+<details>
+<summary>Wall-clock timing</summary>
 
-- **2.75x** faster than the pre-optimization baseline
-- **2.83x** faster than the upstream pure C implementation
+| Implementation | Commit | Median wall-clock ms | Mean ms | Best ms | Wall-clock RTF |
+|---|---:|---:|---:|---:|---:|
+| qwen-asr (first) | [`bf52daf`](https://github.com/huanglizhuo/QwenASR/commit/bf52daf) | 2,171 | 2,205 | 2,150 | 12.99x |
+| qwen-asr (latest) | [`0f5f065`](https://github.com/huanglizhuo/QwenASR/commit/0f5f065) | 1,263 | 1,289 | 1,252 | 22.34x |
+| pure C upstream | [`b00b789`](https://github.com/antirez/qwen-asr/commit/b00b789) | 2,154 | 2,148 | 2,125 | 13.08x |
+| second-state MLX GPU | [`3fa6734`](https://github.com/second-state/qwen3_asr_rs/commit/3fa6734) | 2,982 | 3,049 | 2,940 | 9.44x |
+| mlx-audio Python MLX | [`0.4.3`](https://github.com/Blaizzy/mlx-audio) | 1,855 | 1,918 | 1,806 | 15.18x |
 
-Reproduce with `./bench/benchmark-all.sh`.
+</details>
+
+![Latency](bench/charts/benchmark-unified-latency.png)
+
+![Realtime factor](bench/charts/benchmark-unified-rtf.png)
+
+- **Fastest overall**: qwen-asr latest `0f5f065`
+- qwen-asr latest is **2.72x** faster than qwen-asr first `bf52daf` by median inference time
+- qwen-asr latest is **2.79x** faster than the upstream pure C implementation by median inference time
+- qwen-asr latest is **4.12x** faster than second-state MLX Metal GPU by median inference time
+- qwen-asr latest is **1.18x** faster than mlx-audio Python MLX (8-bit) by median inference time
+
+Reproduce all results:
+
+```bash
+# qwen-asr first + latest + pure C + second-state MLX GPU + mlx-audio
+./bench/benchmark-all.sh --runs 10
+```
+
+### Why does pure CPU Rust beat GPU?
+
+1. **Hand-optimized NEON kernels** — Custom `vDSP`/`Accelerate`, hand-written `neon_dotprod` matmul, and fused fast-attention specifically tuned for the 0.6B model and Apple Silicon cache hierarchy.
+2. **Zero framework overhead** — No tensor dispatch, memory pools, or FFI bridging. 100% Rust end-to-end.
+3. **Model too small for GPU** — A 0.6B model can't saturate the Metal GPU. Kernel launch overhead and CPU↔GPU copies dominate. Both MLX backends are ~2–4× slower than the CPU path.
+4. **mlx-audio 8-bit overhead** — Quantization saves memory but dequantization during compute adds extra work.
 
 ## Quick Start
 
