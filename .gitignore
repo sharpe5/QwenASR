@@ -11,6 +11,7 @@
 /bench/generate_unified_charts.py
 /qwen3-aligner-0.6b
 /tmp/
+/librispeech-wer-bench/
 
 /flutter/qwen_asr/rust/target
 
