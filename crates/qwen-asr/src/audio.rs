@@ -380,18 +380,28 @@ pub fn mel_spectrogram(samples: &[f32]) -> Option<(Vec<f32>, usize)> {
 
 /// Drop long silent spans. Adaptive RMS gating with spike rejection.
 pub fn compact_silence(samples: &[f32]) -> Vec<f32> {
+    compact_silence_with_params(samples, 0.008, 2, 20)
+}
+
+pub fn compact_silence_fast(samples: &[f32]) -> Vec<f32> {
+    compact_silence_with_params(samples, 0.0205, 1, 0)
+}
+
+fn compact_silence_with_params(
+    samples: &[f32],
+    base_thresh: f32,
+    pad_voice_windows: usize,
+    pass_windows: usize,
+) -> Vec<f32> {
     let n_samples = samples.len();
     if n_samples == 0 {
         return Vec::new();
     }
 
     let win = 160; // 10ms at 16kHz
-    let base_thresh = 0.0205f32;
     let max_thresh = 0.025f32;
     let smooth_alpha = 0.2f32;
     let min_voice_windows = 5;
-    let pad_voice_windows = 1;
-    let pass_windows = 0;
 
     let n_win = n_samples.div_ceil(win);
     let mut rms_vals = vec![0.0f32; n_win];

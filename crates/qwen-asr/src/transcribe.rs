@@ -427,7 +427,11 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     ctx.perf_audio_ms = 1000.0 * samples.len() as f64 / SAMPLE_RATE as f64;
 
     let audio_samples = if ctx.skip_silence {
-        let compacted = audio::compact_silence(samples);
+        let compacted = if ctx.segment_sec > 0.0 {
+            audio::compact_silence_fast(samples)
+        } else {
+            audio::compact_silence(samples)
+        };
         if kernels::verbose() >= 1 {
             let used_pct = 100.0 * compacted.len() as f32 / samples.len().max(1) as f32;
             eprintln!(
@@ -597,7 +601,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     };
 
     let audio_samples = if ctx.skip_silence {
-        audio::compact_silence(samples)
+        audio::compact_silence_fast(samples)
     } else {
         samples.to_vec()
     };

@@ -1835,26 +1835,12 @@ pub fn quantize_bf16_weights_to_int8(w_bf16: *const u16, out_dim: usize, in_dim:
 pub fn argmax_matvec_int8(x: &[f32], w_int8: &[i8], w_scales: &[f32], in_dim: usize, out_dim: usize) -> usize {
     let (x_int8, x_scale) = quantize_f32_to_int8(x);
     let n_threads = get_num_threads();
-    // ASR decode overwhelmingly emits low-rank byte/BPE text tokens; control
-    // tokens live at the high end. Keep both ranges to cut vocab scan cost.
-    let low_end = if out_dim > 120_000 { 39_000 } else { out_dim };
-    let high_start = if out_dim > 120_000 { out_dim.saturating_sub(512) } else { out_dim };
-
     #[cfg(target_arch = "aarch64")]
     {
         if n_threads <= 1 {
             let (best, _) = unsafe {
-                neon::argmax_int8_range(x_int8.as_ptr(), x_scale, w_int8.as_ptr(), w_scales, in_dim, 0, low_end)
+                neon::argmax_int8_range(x_int8.as_ptr(), x_scale, w_int8.as_ptr(), w_scales, in_dim, 0, out_dim)
             };
-            if high_start < out_dim {
-                let (hi_best, hi_val) = unsafe {
-                    neon::argmax_int8_range(x_int8.as_ptr(), x_scale, w_int8.as_ptr(), w_scales, in_dim, high_start, out_dim)
-                };
-                let (_, best_val) = unsafe {
-                    neon::argmax_int8_range(x_int8.as_ptr(), x_scale, w_int8.as_ptr(), w_scales, in_dim, best, best + 1)
-                };
-                return if hi_val > best_val { hi_best } else { best };
-            }
             return best;
         }
 
@@ -1868,9 +1854,9 @@ pub fn argmax_matvec_int8(x: &[f32], w_int8: &[i8], w_scales: &[f32], in_dim: us
         let bv_ptr = best_vals.as_mut_ptr() as usize;
 
         parallel_for(|tid, nt| {
-            let chunk = low_end.div_ceil(nt);
+            let chunk = out_dim.div_ceil(nt);
             let start = tid * chunk;
-            let end = (start + chunk).min(low_end);
+            let end = (start + chunk).min(out_dim);
             if start >= end {
                 unsafe {
                     *(bv_ptr as *mut f32).add(tid) = -1e30;
@@ -1895,14 +1881,6 @@ pub fn argmax_matvec_int8(x: &[f32], w_int8: &[i8], w_scales: &[f32], in_dim: us
             if best_vals[i] > best_val {
                 best_val = best_vals[i];
                 best = best_indices[i];
-            }
-        }
-        if high_start < out_dim {
-            let (hi_best, hi_val) = unsafe {
-                neon::argmax_int8_range(x_int8_ptr as *const i8, x_scale, w_int8_ptr as *const i8, w_scales, in_dim, high_start, out_dim)
-            };
-            if hi_val > best_val {
-                best = hi_best;
             }
         }
         return best;
