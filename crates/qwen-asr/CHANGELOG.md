@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/huanglizhuo/QwenASR/compare/qwen-asr-v0.6.0...qwen-asr-v0.7.0) (2026-05-14)
+
+
+### Features
+
+* improve ASR WER and streaming performance ([c41d2fc](https://github.com/huanglizhuo/QwenASR/commit/c41d2fcc5ada21aa3b64920cff8166255752e464))
+
 ## [0.6.0](https://github.com/huanglizhuo/QwenASR/compare/qwen-asr-v0.5.0...qwen-asr-v0.6.0) (2026-05-10)
 
 
