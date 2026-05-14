@@ -324,7 +324,7 @@ fn transcribe_segment(
                 cb(&String::from_utf8_lossy(piece_bytes));
             }
 
-            if n_text_tokens >= 40 && matches!(piece_bytes, b"." | b"!" | b"?") {
+            if n_text_tokens >= 24 && matches!(piece_bytes, b"." | b"!" | b"?") {
                 break;
             }
         }
@@ -600,12 +600,6 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         32
     };
 
-    let audio_samples = if ctx.skip_silence {
-        audio::compact_silence_fast(samples)
-    } else {
-        samples.to_vec()
-    };
-
     ctx.reset_perf();
     ctx.perf_audio_ms = 1000.0 * samples.len() as f64 / SAMPLE_RATE as f64;
 
@@ -614,11 +608,22 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         if kernels::verbose() >= 2 {
             eprintln!("Streaming: no token callback, using direct final refinement");
         }
+        let audio_samples = if ctx.skip_silence {
+            audio::compact_silence(samples)
+        } else {
+            samples.to_vec()
+        };
         let tokenizer = load_tokenizer(&ctx.model_dir)?;
         ctx.prepare_prompt_tokens(&tokenizer);
         let (text, _) = transcribe_segment(ctx, &audio_samples, &tokenizer, None)?;
         return Some(text);
     }
+
+    let audio_samples = if ctx.skip_silence {
+        audio::compact_silence_fast(samples)
+    } else {
+        samples.to_vec()
+    };
 
     let tokenizer = load_tokenizer(&ctx.model_dir)?;
     if !ctx.prepare_prompt_tokens(&tokenizer) {
@@ -685,7 +690,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         let mut partial_seq = 0;
         let mut partial_enc: Vec<f32> = Vec::new();
         let mut partial_keys: Vec<PrefillRowKey> = Vec::new();
-        if full_end < audio_cursor {
+        if is_final && full_end < audio_cursor {
             let _partial_samples = audio_cursor - full_end;
             if let Some((mel, mel_frames)) =
                 audio::mel_spectrogram(&audio_samples[full_end..audio_cursor])
@@ -709,6 +714,13 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
         let enc_ms = elapsed_ms(t0);
         ctx.perf_encode_ms += enc_ms;
+
+        if !is_final && chunk_idx < unfixed_chunks {
+            prev_prefill_keys.clear();
+            ctx.perf_total_ms += elapsed_ms(chunk_t0);
+            chunk_idx += 1;
+            continue;
+        }
 
         // Prefix rollback
         let n_prefix_tokens = if ctx.past_text_conditioning
@@ -856,6 +868,13 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             );
         }
 
+        // Save for next chunk
+        prev_prefill_keys.clear();
+        prev_prefill_keys.extend_from_slice(&prefill_keys[..prefill_len]);
+
+        let prefill_ms = elapsed_ms(t0);
+        ctx.perf_decode_ms += prefill_ms;
+
         let last_embed = &input_embeds[prefill_len * dim..(prefill_len + 1) * dim];
         let mut token = decoder::decoder_forward(
             &ctx.decoder,
@@ -865,13 +884,6 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             &mut ctx.dec_bufs,
             last_embed,
         );
-
-        // Save for next chunk
-        prev_prefill_keys.clear();
-        prev_prefill_keys.extend_from_slice(&prefill_keys[..prefill_len]);
-
-        let prefill_ms = elapsed_ms(t0);
-        ctx.perf_decode_ms += prefill_ms;
 
         // Autoregressive decode
         let t0 = get_time_ms();
