@@ -6,6 +6,8 @@ for minimal RAM usage; SIMD kernels (NEON / AVX2+FMA) accelerate inference.
 
 Current benchmark results are published in the repository README and compare the
 Rust CPU implementation with upstream C and MLX-based GPU baselines.
+LibriSpeech WER benchmark scripts are available in `librispeech-wer-bench/` for
+checking offline and streaming recognition quality across changes.
 
 ## Prerequisites
 
