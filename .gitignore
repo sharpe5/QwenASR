@@ -11,7 +11,10 @@
 /bench/generate_unified_charts.py
 /qwen3-aligner-0.6b
 /tmp/
-/librispeech-wer-bench/
+/librispeech-wer-bench/*
+!/librispeech-wer-bench/librispeech_wer.py
+!/librispeech-wer-bench/run_wer_range.py
+!/librispeech-wer-bench/README.md
 
 /flutter/qwen_asr/rust/target
 
