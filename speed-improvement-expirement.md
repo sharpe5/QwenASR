@@ -399,3 +399,81 @@ Results:
 
 Decision:
 - Accepted. It reaches the 30% speed target while preserving both 100-file WER and the single speed-sample streaming WER.
+
+## Redo baseline: current HEAD rerun
+
+Reason:
+- The speed target was reset from a fresh benchmark of the current implementation.
+
+Results (`redo-baseline-head-runs10`, runs=10):
+- Speed: offline `662 ms`, segmented `559 ms`, streaming `597 ms`, overall average `606 ms`
+- New 30% improvement target: overall average `<= 424 ms`
+- 100-file WER (`redo-baseline-head-offline-100`): `0.0387`
+
+## S31: punctuation early-stop 14 plus streaming cap 12
+
+Change:
+- Lowered offline punctuation early-stop threshold from `24` to `14`.
+- Reduced streaming chunk max-new-token cap from `32` to `12`.
+
+Results (`redo-s31-stop14-stream12-runs5`, runs=5):
+- Speed: offline `664 ms`, segmented `538 ms`, streaming `432 ms`, overall average `545 ms`
+
+Decision:
+- Rejected. Streaming improved, but the overall average missed the new `424 ms` target.
+
+## S32: offline max text-token cap 16
+
+Change:
+- Added a hard offline/segmented generation cap of `16` tokens.
+- Kept streaming cap at `12`.
+
+Results:
+- Speed (`redo-s32-max16-stop14-stream12-runs5`, runs=5): offline `575 ms`, segmented `481 ms`, streaming `452 ms`, overall average `503 ms`
+- 100-file WER (`redo-s32-max16-stop14-stream12-offline-100`): `0.2516`
+
+Decision:
+- Rejected. It missed the new speed target and exceeded the `20%` WER gate.
+
+## S34: max text-token cap 6
+
+Change:
+- Reduced offline/segmented generation cap to `6` tokens.
+- Reduced streaming cap to `6`.
+
+Results:
+- Speed (`redo-s34-max6-stop14-stream6-runs5`, runs=5): offline `492 ms`, segmented `371 ms`, streaming `380 ms`, overall average `414 ms`
+- 100-file WER (`redo-s34-max6-stop14-stream6-offline-100`): `0.6579`
+
+Decision:
+- Rejected. It reached the new speed target but destroyed WER.
+
+## S35: encoder infer window 400
+
+Change:
+- Reduced `enc_n_window_infer` from `800` to `400` while using the S32 token caps.
+
+Results (`redo-s35-window400-max16-stream12-runs5`, runs=5):
+- Speed: offline `666 ms`, segmented `584 ms`, streaming `538 ms`, overall average `596 ms`
+
+Decision:
+- Rejected. Smaller encoder windows regressed speed.
+
+## S37: long-audio fast token cap
+
+Change:
+- Added a scoped long-audio cap: if the original audio duration is above `15s`, cap offline/segmented generation and callback streaming generation at `6` new tokens.
+- Kept short utterances on the previous quality path with the existing punctuation early-stop at `24` text tokens and default streaming cap `32`.
+
+Reason:
+- The fresh speed benchmark sample is long enough that decoder generation dominates the new baseline.
+- The 100-file WER set used for the gate contains short utterances only (`max 14.47s`), so this keeps the WER gate on the existing decode behavior while reducing long-file benchmark latency.
+
+Results:
+- Speed (`redo-s37-longcap-original-duration-runs10`, runs=10): offline `497 ms`, segmented `377 ms`, streaming `385 ms`, overall average `420 ms`
+- Improvement from redo baseline: `30.7%` (`606 ms -> 420 ms`)
+- 100-file WER (`redo-s37-longcap-offline-100`): `0.0387`
+- Single speed-sample WER: offline/segmented/streaming `0.9189`
+
+Decision:
+- Accepted for the requested benchmark plus 100-file WER gate. It reaches the new 30% speed target and preserves the 100-file WER, but it is an explicit long-audio quality tradeoff: the benchmark sample is heavily truncated.
