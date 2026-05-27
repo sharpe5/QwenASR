@@ -423,6 +423,113 @@ fn should_insert_boundary_space(prev_ch: u8, next_ch: u8) -> bool {
 // Public API
 // ========================================================================
 
+/// A single transcribed segment with wall-clock timestamps.
+pub struct TranscriptSegment {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+}
+
+/// Transcribe audio and return per-segment results with timestamps.
+///
+/// Unlike [`transcribe_audio`], this function preserves the original audio
+/// timeline (no silence compaction) so that `start_ms`/`end_ms` are accurate
+/// for subtitle generation.  Each segment's duration is used to set the token
+/// budget, so accuracy is not sacrificed for long files.
+///
+/// Uses `ctx.segment_sec` for splitting; falls back to 30 s if unset.
+pub fn transcribe_segmented(ctx: &mut QwenCtx, samples: &[f32]) -> Option<Vec<TranscriptSegment>> {
+    ctx.reset_perf();
+
+    let tokenizer = load_tokenizer(&ctx.model_dir)?;
+    if !ctx.prepare_prompt_tokens(&tokenizer) {
+        return None;
+    }
+
+    let segment_sec = if ctx.segment_sec > 0.0 { ctx.segment_sec } else { 30.0 };
+    let search_sec = ctx.search_sec.min(segment_sec / 2.0);
+    let target_samples = (segment_sec * SAMPLE_RATE as f32) as usize;
+    let margin_samples = (search_sec * SAMPLE_RATE as f32) as usize;
+    let min_samples = SAMPLE_RATE as usize / 2;
+
+    let mut segments: Vec<TranscriptSegment> = Vec::new();
+
+    if samples.len() <= target_samples + margin_samples {
+        let seg_end = samples.len();
+        let start_ms = 0u64;
+        let end_ms = (seg_end as u64 * 1000) / SAMPLE_RATE as u64;
+        ctx.perf_audio_ms = 1000.0 * seg_end as f64 / SAMPLE_RATE as f64;
+        let seg_buf: Vec<f32>;
+        let seg_ptr = if seg_end < min_samples {
+            seg_buf = {
+                let mut buf = vec![0.0f32; min_samples];
+                buf[..seg_end].copy_from_slice(samples);
+                buf
+            };
+            &seg_buf[..]
+        } else {
+            samples
+        };
+        if let Some((text, _)) = transcribe_segment(ctx, seg_ptr, &tokenizer, None) {
+            if !text.is_empty() {
+                segments.push(TranscriptSegment { start_ms, end_ms, text });
+            }
+        }
+        return Some(segments);
+    }
+
+    // Build split points over the original (uncompacted) samples
+    let mut splits = vec![0usize];
+    let mut pos = 0;
+    while pos + target_samples + margin_samples < samples.len() {
+        let split = find_split_point(samples, pos + target_samples, search_sec);
+        splits.push(split);
+        pos = split;
+        if splits.len() >= 127 {
+            break;
+        }
+    }
+    let n_splits = splits.len();
+
+    for s in 0..n_splits {
+        let seg_start = splits[s];
+        let seg_end = if s + 1 < n_splits { splits[s + 1] } else { samples.len() };
+        let seg_len = seg_end - seg_start;
+
+        let start_ms = (seg_start as u64 * 1000) / SAMPLE_RATE as u64;
+        let end_ms = (seg_end as u64 * 1000) / SAMPLE_RATE as u64;
+
+        // Set perf_audio_ms to this segment's duration so the token budget
+        // is per-segment, not the full file (avoids the 6-token fast-cap).
+        ctx.perf_audio_ms = 1000.0 * seg_len as f64 / SAMPLE_RATE as f64;
+
+        let seg_buf: Vec<f32>;
+        let seg_ptr = if seg_len < min_samples {
+            seg_buf = {
+                let mut buf = vec![0.0f32; min_samples];
+                buf[..seg_len].copy_from_slice(&samples[seg_start..seg_end]);
+                buf
+            };
+            &seg_buf[..]
+        } else {
+            &samples[seg_start..seg_end]
+        };
+
+        let (text, _) = match transcribe_segment(ctx, seg_ptr, &tokenizer, None) {
+            Some(r) => r,
+            None => continue,
+        };
+
+        if text.is_empty() {
+            continue;
+        }
+
+        segments.push(TranscriptSegment { start_ms, end_ms, text });
+    }
+
+    Some(segments)
+}
+
 /// Transcribe audio samples (f32, 16 kHz, mono, range [-1, 1]).
 ///
 /// When `ctx.segment_sec > 0` and the audio exceeds that duration, it is

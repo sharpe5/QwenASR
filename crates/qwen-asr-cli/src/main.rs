@@ -9,6 +9,90 @@ use context::QwenCtx;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "mkv", "mov", "avi", "webm", "m4v", "flv", "ts", "mpg", "mpeg", "wmv",
+];
+
+fn is_video_file(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| VIDEO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Extract audio from a video file using ffmpeg, returning 16 kHz mono f32 samples.
+fn extract_audio_from_video(path: &str) -> Option<Vec<f32>> {
+    let output = std::process::Command::new("ffmpeg")
+        .args(["-loglevel", "error", "-i", path, "-ar", "16000", "-ac", "1", "-f", "s16le", "pipe:1"])
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                eprintln!("Error: ffmpeg not found — install it to process video files");
+                eprintln!("  macOS:  brew install ffmpeg");
+                eprintln!("  Linux:  sudo apt install ffmpeg");
+            } else {
+                eprintln!("Error: failed to run ffmpeg: {}", e);
+            }
+        })
+        .ok()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("Error: ffmpeg failed:\n{}", stderr);
+        return None;
+    }
+
+    let raw = &output.stdout;
+    if raw.len() % 2 != 0 {
+        eprintln!("Error: ffmpeg returned odd number of bytes");
+        return None;
+    }
+
+    let samples: Vec<f32> = raw
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        .collect();
+    Some(samples)
+}
+
+/// Load audio from either a video (via ffmpeg) or a WAV file.
+fn load_audio(path: &str) -> Option<Vec<f32>> {
+    if is_video_file(path) {
+        extract_audio_from_video(path)
+    } else {
+        audio::load_wav(path)
+    }
+}
+
+fn ms_to_srt_time(ms: u64) -> String {
+    let h = ms / 3_600_000;
+    let m = (ms % 3_600_000) / 60_000;
+    let s = (ms % 60_000) / 1_000;
+    let millis = ms % 1_000;
+    format!("{:02}:{:02}:{:02},{:03}", h, m, s, millis)
+}
+
+fn format_srt(segments: &[transcribe::TranscriptSegment]) -> String {
+    let mut out = String::new();
+    let mut idx = 1u32;
+    for seg in segments {
+        if seg.text.trim().is_empty() {
+            continue;
+        }
+        out.push_str(&idx.to_string());
+        out.push('\n');
+        out.push_str(&ms_to_srt_time(seg.start_ms));
+        out.push_str(" --> ");
+        out.push_str(&ms_to_srt_time(seg.end_ms));
+        out.push('\n');
+        out.push_str(seg.text.trim());
+        out.push_str("\n\n");
+        idx += 1;
+    }
+    out
+}
+
 fn stream_token(piece: &str) {
     use std::io::Write;
     print!("{}", piece);
@@ -17,10 +101,10 @@ fn stream_token(piece: &str) {
 
 fn usage(prog: &str) {
     eprintln!("qwen-asr — Qwen3-ASR speech-to-text (pure Rust)\n");
-    eprintln!("Usage: {} -d <model_dir> (-i <input.wav> | --stdin | --live) [options]\n", prog);
+    eprintln!("Usage: {} -d <model_dir> (-i <input> | --stdin | --live) [options]\n", prog);
     eprintln!("Required:");
     eprintln!("  -d <dir>      Model directory (with *.safetensors, vocab.json)");
-    eprintln!("  -i <file>     Input WAV file (16-bit PCM, any sample rate)");
+    eprintln!("  -i <file>     Input file: WAV (16-bit PCM) or video (mp4/mkv/mov/…, requires ffmpeg)");
     eprintln!("  --stdin       Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)");
     eprintln!("\nLive capture (macOS only):");
     eprintln!("  --live                      Capture from audio input device in real time");
@@ -42,6 +126,8 @@ fn usage(prog: &str) {
     eprintln!("\nAlignment mode (requires ForcedAligner model):");
     eprintln!("  --align <text>             Align transcript to audio (word-level timestamps)");
     eprintln!("  --align-language <lang>    Language for word splitting (default: English)");
+    eprintln!("\nSubtitle output:");
+    eprintln!("  --srt [path]  Write SRT subtitle file (default: <input>.srt); requires -i");
     eprintln!("  --profile     Print per-operation timing breakdown");
     eprintln!("  --debug       Debug output (per-layer details)");
     eprintln!("  --silent      No status output (only transcription on stdout)");
@@ -103,6 +189,9 @@ fn main() {
     let mut profile = false;
     let mut align_text: Option<String> = None;
     let mut align_language: Option<String> = None;
+    // None = no SRT, Some(path) = write SRT to path
+    let mut srt_path: Option<String> = None;
+    let mut srt_requested = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -175,6 +264,16 @@ fn main() {
             "--align-language" => {
                 i += 1;
                 align_language = args.get(i).cloned();
+            }
+            "--srt" => {
+                srt_requested = true;
+                // Optional next arg: path (if present and doesn't start with '-')
+                if let Some(next) = args.get(i + 1) {
+                    if !next.starts_with('-') {
+                        srt_path = Some(next.clone());
+                        i += 1;
+                    }
+                }
             }
             "--stdin" => {
                 use_stdin = true;
@@ -250,6 +349,27 @@ fn main() {
     if input_count > 1 {
         eprintln!("Error: -i, --stdin, and --live are mutually exclusive");
         std::process::exit(1);
+    }
+
+    // Resolve SRT output path (--srt requires -i)
+    if srt_requested {
+        if input_wav.is_none() {
+            eprintln!("Error: --srt requires -i <file>");
+            std::process::exit(1);
+        }
+        if srt_path.is_none() {
+            // Default: same stem as input, .srt extension
+            let input = input_wav.as_ref().unwrap();
+            let stem = std::path::Path::new(input)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(input.as_str());
+            let dir = std::path::Path::new(input)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or(".");
+            srt_path = Some(format!("{}/{}.srt", dir, stem));
+        }
     }
 
     kernels::set_verbose(verbosity);
@@ -407,12 +527,68 @@ fn main() {
         }
     }
 
+    // SRT subtitle mode: load audio (video or WAV), transcribe with timestamps
+    if let Some(ref out_path) = srt_path {
+        let input = input_wav.as_ref().unwrap();
+        if verbosity >= 1 {
+            if is_video_file(input) {
+                eprintln!("Extracting audio from video: {}", input);
+            }
+        }
+        let samples = match load_audio(input) {
+            Some(s) => s,
+            None => {
+                eprintln!("Failed to load audio from {}", input);
+                std::process::exit(1);
+            }
+        };
+        let segments = match transcribe::transcribe_segmented(&mut ctx, &samples) {
+            Some(s) => s,
+            None => {
+                eprintln!("Transcription failed");
+                std::process::exit(1);
+            }
+        };
+        if emit_tokens {
+            println!();
+        }
+        let srt = format_srt(&segments);
+        match std::fs::write(out_path, &srt) {
+            Ok(()) => {
+                if verbosity >= 1 {
+                    eprintln!("SRT written to {}", out_path);
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: failed to write {}: {}", out_path, e);
+                std::process::exit(1);
+            }
+        }
+
+        if verbosity >= 1 {
+            let tokens_per_sec = if ctx.perf_total_ms > 0.0 {
+                1000.0 * ctx.perf_text_tokens as f64 / ctx.perf_total_ms
+            } else {
+                0.0
+            };
+            eprintln!(
+                "Inference: {:.0} ms, {} text tokens ({:.2} tok/s, encoding: {:.0}ms, decoding: {:.0}ms)",
+                ctx.perf_total_ms, ctx.perf_text_tokens, tokens_per_sec,
+                ctx.perf_encode_ms, ctx.perf_decode_ms
+            );
+        }
+        if profile {
+            kernels::profile_report();
+        }
+        return;
+    }
+
     // Transcribe
     let text = if stream_mode {
         let samples = if use_stdin {
             audio::read_pcm_stdin()
         } else {
-            audio::load_wav(input_wav.as_ref().unwrap())
+            load_audio(input_wav.as_ref().unwrap())
         };
         match samples {
             Some(s) => transcribe::transcribe_stream(&mut ctx, &s),
@@ -421,7 +597,15 @@ fn main() {
     } else if use_stdin {
         transcribe::transcribe_stdin(&mut ctx)
     } else {
-        transcribe::transcribe(&mut ctx, input_wav.as_ref().unwrap())
+        let input = input_wav.as_ref().unwrap();
+        if is_video_file(input) {
+            match load_audio(input) {
+                Some(s) => transcribe::transcribe_audio(&mut ctx, &s),
+                None => None,
+            }
+        } else {
+            transcribe::transcribe(&mut ctx, input)
+        }
     };
 
     match text {
