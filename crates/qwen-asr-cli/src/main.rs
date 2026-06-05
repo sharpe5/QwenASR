@@ -145,42 +145,48 @@ fn stream_token(piece: &str) {
 }
 
 fn usage(prog: &str) {
+    // All option descriptions align to one column: 2-space indent + label padded
+    // to the longest label width (`--stream-max-new-tokens <n>` = 27) + 2 spaces.
+    fn opt(label: &str, desc: &str) {
+        eprintln!("  {:<27}  {}", label, desc);
+    }
+
     eprintln!("qwen-asr — Qwen3-ASR speech-to-text (pure Rust)\n");
     eprintln!("Usage: {} -d <model_dir> (-i <input> | --stdin | --live) [options]\n", prog);
     eprintln!("Required:");
-    eprintln!("  -d <dir>      Model directory (with *.safetensors, vocab.json)");
-    eprintln!("  -i <file>     Input file: WAV (16-bit PCM) or video (mp4/mkv/mov/…, requires ffmpeg)");
-    eprintln!("  --stdin       Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)");
+    opt("-d <dir>", "Model directory (with *.safetensors, vocab.json)");
+    opt("-i <file>", "Input file: WAV (16-bit PCM) or video (mp4/mkv/mov/…, requires ffmpeg)");
+    opt("--stdin", "Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)");
     eprintln!("\nLive capture (macOS only):");
-    eprintln!("  --live                      Capture from audio input device in real time");
-    eprintln!("  --device <name>             Input device name (default: system default)");
-    eprintln!("  --list-devices              List available audio input devices and exit");
-    eprintln!("  --vad                       Live VAD mode: detect speech segments, transcribe each");
+    opt("--live", "Capture from audio input device in real time (default: off)");
+    opt("--device <name>", "Input device name (default: system default)");
+    opt("--list-devices", "List available audio input devices and exit");
+    opt("--vad", "Live VAD mode: detect speech segments, transcribe each (default: off)");
     eprintln!("\nOptions:");
-    eprintln!("  -t <n>        Number of threads (default: all CPUs, capped at 10)");
-    eprintln!("  -S <secs>     Segment target seconds (default: 30; 0 = full-audio decode)");
-    eprintln!("  -W <secs>     Segment-cutting silence search window ± seconds (default: 3.0)");
-    eprintln!("  --stream      Streaming mode: process in chunks with prefix rollback");
-    eprintln!("  --stream-max-new-tokens <n>  Max generated tokens per stream step (default: 32)");
-    eprintln!("  --stream-chunk-sec <secs>   Chunk size for streaming (default: 2.0, min ~1.0)");
-    eprintln!("  --enc-window-sec <secs>    Encoder attention window in seconds (1..8, default 8)");
-    eprintln!("  --past-text <yes|no|auto>  Reuse previously decoded text as context");
-    eprintln!("  --skip-silence              Drop long silent spans before inference (off by default)");
-    eprintln!("  --prompt <text>            System prompt for biasing");
-    eprintln!("  --language <lang>          Force output language");
+    opt("-t <n>", "Number of threads (default: all CPUs, capped at 10)");
+    opt("-S <secs>", "Segment target seconds (default: 30; 0 = full-audio decode)");
+    opt("-W <secs>", "Segment-cutting silence search window ± seconds (default: 3.0)");
+    opt("--stream", "Streaming mode: process in chunks with prefix rollback (default: off)");
+    opt("--stream-max-new-tokens <n>", "Max generated tokens per stream step (default: 32)");
+    opt("--stream-chunk-sec <secs>", "Chunk size for streaming (default: 2.0, min ~1.0)");
+    opt("--enc-window-sec <secs>", "Encoder attention window in seconds (1..8, default: 8)");
+    opt("--past-text <yes|no|auto>", "Reuse previously decoded text as context (default: auto — yes for --stream, else no)");
+    opt("--skip-silence", "Drop long silent spans before inference (default: off)");
+    opt("--prompt <text>", "System prompt for biasing (default: none)");
+    opt("--language <lang>", "Force output language (default: auto-detect)");
     eprintln!("\nAlignment mode (requires ForcedAligner model):");
-    eprintln!("  --align <text>             Align transcript to audio (word-level timestamps); off by default, supplying <text> activates alignment mode");
-    eprintln!("  --align-language <lang>    Language for word splitting (default: English)");
+    opt("--align <text>", "Align transcript to audio (word-level timestamps); supply <text> to activate (default: off)");
+    opt("--align-language <lang>", "Language for word splitting (default: English)");
     eprintln!("\nSubtitle output:");
-    eprintln!("  --srt [path]  Write SRT subtitle file (default: <input>.srt); requires -i");
-    eprintln!("  --json        Emit JSON {{\"text\":..,\"segments\":[{{start,end,text}}]}} with per-segment timestamps in seconds (Parakeet-compatible; suppresses token streaming)");
-    eprintln!("  --profile     Print per-operation timing breakdown");
-    eprintln!("  --debug       Debug output (per-layer details)");
-    eprintln!("  --silent      No status output (only transcription on stdout)");
+    opt("--srt [path]", "Write SRT subtitle file (default path: <input>.srt); requires -i (default: off)");
+    opt("--json", "Emit JSON {\"text\":..,\"segments\":[{start,end,text}]} with per-segment timestamps in seconds (Parakeet-compatible; suppresses token streaming) (default: off)");
+    opt("--profile", "Print per-operation timing breakdown (default: off)");
+    opt("--debug", "Debug output (per-layer details) (default: off)");
+    opt("--silent", "No status output (only transcription on stdout) (default: off)");
     eprintln!("\nModel management:");
     eprintln!("  {} download [--list] [<model>] [--output <dir>]", prog);
-    eprintln!("  -h            Show this help");
-    eprintln!("  -v, --version Show version and exit");
+    opt("-h", "Show this help");
+    opt("-v, --version", "Show version and exit");
 }
 
 fn parse_past_text_mode(s: &str) -> Option<i32> {
