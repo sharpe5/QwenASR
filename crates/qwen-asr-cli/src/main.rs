@@ -113,14 +113,14 @@ fn usage(prog: &str) {
     eprintln!("  --vad                       Live VAD mode: detect speech segments, transcribe each");
     eprintln!("\nOptions:");
     eprintln!("  -t <n>        Number of threads (default: all CPUs)");
-    eprintln!("  -S <secs>     Segment target seconds (default: 0 = full-audio decode)");
+    eprintln!("  -S <secs>     Segment target seconds (default: 30; 0 = full-audio decode)");
     eprintln!("  -W <secs>     Segment-cutting silence search window ± seconds (default: 3.0)");
     eprintln!("  --stream      Streaming mode: process in chunks with prefix rollback");
     eprintln!("  --stream-max-new-tokens <n>  Max generated tokens per stream step (default: 32)");
     eprintln!("  --stream-chunk-sec <secs>   Chunk size for streaming (default: 2.0, min ~1.0)");
     eprintln!("  --enc-window-sec <secs>    Encoder attention window in seconds (1..8, default 8)");
     eprintln!("  --past-text <yes|no|auto>  Reuse previously decoded text as context");
-    eprintln!("  --skip-silence              Drop long silent spans before inference");
+    eprintln!("  --skip-silence              Drop long silent spans before inference (off by default)");
     eprintln!("  --prompt <text>            System prompt for biasing");
     eprintln!("  --language <lang>          Force output language");
     eprintln!("\nAlignment mode (requires ForcedAligner model):");

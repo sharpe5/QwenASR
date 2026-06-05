@@ -18,7 +18,7 @@ pub type TokenCallback = Box<dyn Fn(&str) + Send>;
 ///
 /// | Field | Default | Description |
 /// |-------|---------|-------------|
-/// | `segment_sec` | 0.0 | Segment duration for long audio (0 = no splitting) |
+/// | `segment_sec` | 30.0 | Segment duration for long audio (0 = no splitting) |
 /// | `skip_silence` | false | Drop silent spans before transcription |
 /// | `token_cb` | None | Streaming callback invoked for each decoded token |
 /// | `prompt` | None | Optional text prompt (set via [`QwenCtx::set_prompt`]) |
@@ -141,14 +141,14 @@ impl QwenCtx {
             enc_bufs: EncoderBuffers::new(),
             rope_cache: RopeCache::new(),
             token_cb: None,
-            segment_sec: 0.0,
+            segment_sec: 30.0,
             search_sec: 3.0,
             stream_chunk_sec: 8.0,
             stream_rollback: 5,
             stream_unfixed_chunks: 99,
             stream_max_new_tokens: 32,
             past_text_conditioning: false,
-            skip_silence: true,
+            skip_silence: false,
             prompt: None,
             force_language: None,
             prompt_tokens: None,

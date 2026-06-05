@@ -21,8 +21,6 @@ const STREAM_STALE_CHUNKS: i32 = 4;
 const STREAM_RESET_INTERVAL_CHUNKS: i32 = 45;
 const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
-const LONG_AUDIO_FAST_CAP_SEC: usize = 15;
-const LONG_AUDIO_FAST_MAX_TOKENS: i32 = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PrefillRowKey {
@@ -300,11 +298,7 @@ fn transcribe_segment(
 
     // Autoregressive decode
     let t0 = get_time_ms();
-    let max_tokens = if ctx.perf_audio_ms > (LONG_AUDIO_FAST_CAP_SEC as f64 * 1000.0) {
-        LONG_AUDIO_FAST_MAX_TOKENS
-    } else {
-        2048
-    };
+    let max_tokens = 2048;
     let mut n_generated = 0;
     let mut past_asr_text = n_force_prompt_tokens > 0 || n_past > 0;
 
@@ -328,10 +322,6 @@ fn transcribe_segment(
             if let Some(ref cb) = ctx.token_cb {
                 // For the callback, provide lossy UTF-8 for display purposes
                 cb(&String::from_utf8_lossy(piece_bytes));
-            }
-
-            if n_text_tokens >= 24 && matches!(piece_bytes, b"." | b"!" | b"?") {
-                break;
             }
         }
 
@@ -707,14 +697,11 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     let chunk_samples = (ctx.stream_chunk_sec * SAMPLE_RATE as f32) as usize;
     let rollback = ctx.stream_rollback;
     let unfixed_chunks = ctx.stream_unfixed_chunks;
-    let mut max_new_tokens = if ctx.stream_max_new_tokens > 0 {
+    let max_new_tokens = if ctx.stream_max_new_tokens > 0 {
         ctx.stream_max_new_tokens
     } else {
         32
     };
-    if samples.len() > LONG_AUDIO_FAST_CAP_SEC * SAMPLE_RATE as usize {
-        max_new_tokens = max_new_tokens.min(LONG_AUDIO_FAST_MAX_TOKENS);
-    }
 
     ctx.reset_perf();
     ctx.perf_audio_ms = 1000.0 * samples.len() as f64 / SAMPLE_RATE as f64;
