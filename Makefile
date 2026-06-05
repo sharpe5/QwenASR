@@ -5,6 +5,9 @@
 BIN        = qwen-asr
 RELEASE_BIN = target/release/$(BIN)
 
+# Crate version (the published CLI version), read from Cargo.toml.
+VERSION = $(shell grep -m1 '^version' crates/qwen-asr-cli/Cargo.toml | cut -d'"' -f2)
+
 # Release builds target the native CPU for the hand-tuned NEON/AVX kernels
 # (matches the README build guidance). Override e.g. RUSTFLAGS= for portable builds.
 RUSTFLAGS ?= -C target-cpu=native
@@ -20,7 +23,7 @@ MODEL ?= qwen3-asr-0.6b
 # Bare `make` should print the target list, not build the first target.
 .DEFAULT_GOAL := help
 
-.PHONY: help all setup build release run test fmt fmt-check clippy check clean bench download install uninstall info
+.PHONY: help all setup debug release run test fmt fmt-check clippy check clean bench download install uninstall version info
 
 # Default: show available targets
 all: help
@@ -33,7 +36,7 @@ help:
 	@echo "  make run INPUT=audio.wav   - Transcribe a file (builds if needed)"
 	@echo ""
 	@echo "Build:"
-	@echo "  make build     - Debug build (cargo build)"
+	@echo "  make debug     - Debug build (cargo build)"
 	@echo "  make release   - Optimized build, target-cpu=native (cargo build --release)"
 	@echo "  make install   - Install the $(BIN) binary to ~/.cargo/bin (cargo install)"
 	@echo "  make uninstall - Remove the installed $(BIN) binary (cargo uninstall)"
@@ -48,6 +51,7 @@ help:
 	@echo "  make bench     - Run the WER/speed benchmark suite (bench/run.sh)"
 	@echo ""
 	@echo "Other:"
+	@echo "  make version   - Print the CLI version ($(VERSION))"
 	@echo "  make clean     - Remove build artifacts (cargo clean)"
 	@echo "  make info      - Show build configuration"
 	@echo ""
@@ -66,7 +70,7 @@ setup: release download
 # =============================================================================
 # Build
 # =============================================================================
-build:
+debug:
 	cargo build
 
 release:
@@ -124,12 +128,17 @@ install:
 uninstall:
 	cargo uninstall qwen-asr-cli
 
+# Print the version from Cargo.toml (the source of truth; no build required).
+# The built binary also reports it at runtime: `qwen-asr --version`.
+version:
+	@echo "$(BIN) $(VERSION)"
+
 clean:
 	cargo clean
 
 info:
 	@echo "Workspace: $(shell pwd)"
-	@echo "Binary:    $(BIN)"
+	@echo "Binary:    $(BIN) $(VERSION)"
 	@echo "Cargo:     $(shell cargo --version 2>/dev/null || echo 'not found')"
 	@echo "Rustc:     $(shell rustc --version 2>/dev/null || echo 'not found')"
 	@echo "Model dir: $(if $(MODEL_DIR),$(MODEL_DIR),<none — run: make download>)"

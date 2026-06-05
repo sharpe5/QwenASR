@@ -8,6 +8,17 @@ Supports 0.6B and 1.7B models with multiple modes: offline, segmented, streaming
 
 **🚀 Extreme Performance:** On Apple Silicon (M5), the highly optimized CPU implementation transcribes a 28.2s audio sample in just **676ms** (**41.69x realtime**), outperforming both the upstream pure C implementation and measured MLX GPU baselines.
 
+## Table of Contents
+
+- [Auto Research](#auto-research)
+- [Benchmark](#benchmark)
+- [Quick Start](#quick-start)
+- [Usage](#usage)
+  - [JSON output](#json-output)
+- [Build](#build)
+- [OpenClaw Skill](#openclaw-skill)
+- [Acknowledgments](#acknowledgments)
+- [License](#license)
 
 ## Auto Research
 
@@ -68,6 +79,17 @@ Reproduce all results:
 
 ## Quick Start
 
+From a fresh checkout, the `Makefile` takes you from zero to a transcript in two commands:
+
+```bash
+make setup                  # release build + download Qwen3-ASR-0.6B
+make run INPUT=audio.wav    # transcribe
+```
+
+Run `make help` to see all targets (build, install, test, download, bench).
+
+Or use cargo directly:
+
 ```bash
 # Install
 cargo install qwen-asr-cli
@@ -92,6 +114,7 @@ qwen-asr -d qwen3-asr-0.6b -i audio.wav              # basic
 qwen-asr -d qwen3-asr-0.6b -i audio.wav --silent      # transcript only
 cat audio.wav | qwen-asr -d qwen3-asr-0.6b --stdin     # pipe from stdin
 qwen-asr -d qwen3-asr-0.6b -i long.wav -S 30           # segmented (long audio)
+qwen-asr -d qwen3-asr-0.6b -i audio.wav --json         # JSON with per-segment timestamps
 qwen-asr -d qwen3-asr-0.6b -i audio.wav --stream       # streaming
 qwen-asr -d qwen3-asr-0.6b --live --device "BlackHole 2ch"         # live capture (macOS)
 qwen-asr -d qwen3-asr-0.6b --live --vad --device "BlackHole 2ch"   # VAD live
@@ -112,18 +135,34 @@ ffmpeg -i video.mp4 -f s16le -ar 16000 -ac 1 - | qwen-asr -d qwen3-asr-0.6b --st
 | `--list-devices` | List audio input devices | — |
 | `--vad` | VAD live mode | off |
 | `-t <n>` | Thread count | all CPUs |
-| `-S <secs>` | Segment target seconds | 0 (full) |
+| `-S <secs>` | Segment target seconds (`0` = full-audio decode) | 30 |
 | `--stream` | Streaming mode | off |
 | `--stream-chunk-sec <s>` | Chunk size for streaming | 2.0 |
+| `--skip-silence` | Drop long silent spans before inference | off |
 | `--language <lang>` | Force output language (`en`, `zh`, `ja`, ...) | auto |
+| `--srt [path]` | Write SRT subtitle file (default `<input>.srt`) | off |
+| `--json` | Emit Parakeet-compatible JSON with per-segment timestamps | off |
 | `--silent` | Transcript only, no status output | off |
 | `--profile` | Print timing breakdown | off |
 
 </details>
 
+### JSON output
+
+`--json` emits a single structured object (Parakeet-compatible) instead of streaming raw tokens, with per-segment timestamps in seconds:
+
+```json
+{"text": "...full transcript...",
+ "segments": [{"start": 0.000, "end": 19.800, "text": "..."}, ...]}
+```
+
+`start`/`end` are the per-segment timestamps. Token-by-token streaming is suppressed so stdout carries exactly one JSON object. Run without `--skip-silence` for timestamps aligned to the original audio timeline.
+
 ## Build
 
 **Always use release mode.** Debug builds are 10-50x slower.
+
+The `Makefile` wraps the common workflows (`make release`, `make test`, `make install`, `make bench`; `make help` lists all). It sets `RUSTFLAGS="-C target-cpu=native"` for you. To build directly with cargo:
 
 ```bash
 # macOS

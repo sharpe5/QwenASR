@@ -181,6 +181,7 @@ fn usage(prog: &str) {
     eprintln!("\nModel management:");
     eprintln!("  {} download [--list] [<model>] [--output <dir>]", prog);
     eprintln!("  -h            Show this help");
+    eprintln!("  -v, --version Show version and exit");
 }
 
 fn parse_past_text_mode(s: &str) -> Option<i32> {
@@ -194,6 +195,12 @@ fn parse_past_text_mode(s: &str) -> Option<i32> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Handle --version / -v (no model needed)
+    if args.iter().any(|a| a == "--version" || a == "-v") {
+        println!("qwen-asr {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
 
     // Handle `download` subcommand: qwen-asr download [args...]
     if args.len() >= 2 && args[1] == "download" {
