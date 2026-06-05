@@ -93,6 +93,51 @@ fn format_srt(segments: &[transcribe::TranscriptSegment]) -> String {
     out
 }
 
+/// Escape a string for inclusion in a JSON string literal.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Build a Parakeet-compatible JSON transcript:
+/// `{"text":..,"segments":[{"start":S,"end":E,"text":".."}]}`.
+/// `start`/`end` are per-segment timestamps in seconds (3 decimal places).
+fn format_json(segments: &[transcribe::TranscriptSegment]) -> String {
+    let mut full = String::new();
+    let mut segs = String::new();
+    for seg in segments {
+        let text = seg.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if !full.is_empty() {
+            full.push(' ');
+        }
+        full.push_str(text);
+        if !segs.is_empty() {
+            segs.push(',');
+        }
+        segs.push_str(&format!(
+            "{{\"start\":{:.3},\"end\":{:.3},\"text\":\"{}\"}}",
+            seg.start_ms as f64 / 1000.0,
+            seg.end_ms as f64 / 1000.0,
+            json_escape(text),
+        ));
+    }
+    format!("{{\"text\":\"{}\",\"segments\":[{}]}}", json_escape(&full), segs)
+}
+
 fn stream_token(piece: &str) {
     use std::io::Write;
     print!("{}", piece);
@@ -128,6 +173,8 @@ fn usage(prog: &str) {
     eprintln!("  --align-language <lang>    Language for word splitting (default: English)");
     eprintln!("\nSubtitle output:");
     eprintln!("  --srt [path]  Write SRT subtitle file (default: <input>.srt); requires -i");
+    eprintln!("  --json        Emit JSON {{\"text\":..,\"segments\":[{{start,end,text}}]}} with per-segment");
+    eprintln!("                timestamps in seconds (Parakeet-compatible; suppresses token streaming)");
     eprintln!("  --profile     Print per-operation timing breakdown");
     eprintln!("  --debug       Debug output (per-layer details)");
     eprintln!("  --silent      No status output (only transcription on stdout)");
@@ -192,6 +239,7 @@ fn main() {
     // None = no SRT, Some(path) = write SRT to path
     let mut srt_path: Option<String> = None;
     let mut srt_requested = false;
+    let mut json_output = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -274,6 +322,9 @@ fn main() {
                         i += 1;
                     }
                 }
+            }
+            "--json" => {
+                json_output = true;
             }
             "--stdin" => {
                 use_stdin = true;
@@ -377,7 +428,8 @@ fn main() {
         kernels::set_profile(true);
         kernels::profile_reset();
     }
-    let emit_tokens = verbosity > 0;
+    // --json prints one clean object on stdout: no live token streaming.
+    let emit_tokens = verbosity > 0 && !json_output;
 
     // Initialize thread pool
     if n_threads <= 0 {
@@ -525,6 +577,51 @@ fn main() {
             run_live_capture(&mut ctx, device_name.as_deref(), stream_mode, vad_mode, verbosity, profile);
             return;
         }
+    }
+
+    // JSON mode: transcribe with per-segment timestamps, emit one Parakeet-compatible object
+    if json_output {
+        let samples = if use_stdin {
+            audio::read_pcm_stdin()
+        } else {
+            let input = input_wav.as_ref().unwrap();
+            if verbosity >= 1 && is_video_file(input) {
+                eprintln!("Extracting audio from video: {}", input);
+            }
+            load_audio(input)
+        };
+        let samples = match samples {
+            Some(s) => s,
+            None => {
+                eprintln!("Failed to load audio");
+                std::process::exit(1);
+            }
+        };
+        let segments = match transcribe::transcribe_segmented(&mut ctx, &samples) {
+            Some(s) => s,
+            None => {
+                eprintln!("Transcription failed");
+                std::process::exit(1);
+            }
+        };
+        println!("{}", format_json(&segments));
+
+        if verbosity >= 1 {
+            let tokens_per_sec = if ctx.perf_total_ms > 0.0 {
+                1000.0 * ctx.perf_text_tokens as f64 / ctx.perf_total_ms
+            } else {
+                0.0
+            };
+            eprintln!(
+                "Inference: {:.0} ms, {} text tokens ({:.2} tok/s, encoding: {:.0}ms, decoding: {:.0}ms)",
+                ctx.perf_total_ms, ctx.perf_text_tokens, tokens_per_sec,
+                ctx.perf_encode_ms, ctx.perf_decode_ms
+            );
+        }
+        if profile {
+            kernels::profile_report();
+        }
+        return;
     }
 
     // SRT subtitle mode: load audio (video or WAV), transcribe with timestamps
