@@ -157,7 +157,7 @@ fn usage(prog: &str) {
     eprintln!("  --list-devices              List available audio input devices and exit");
     eprintln!("  --vad                       Live VAD mode: detect speech segments, transcribe each");
     eprintln!("\nOptions:");
-    eprintln!("  -t <n>        Number of threads (default: all CPUs)");
+    eprintln!("  -t <n>        Number of threads (default: all CPUs, capped at 10)");
     eprintln!("  -S <secs>     Segment target seconds (default: 30; 0 = full-audio decode)");
     eprintln!("  -W <secs>     Segment-cutting silence search window ± seconds (default: 3.0)");
     eprintln!("  --stream      Streaming mode: process in chunks with prefix rollback");
@@ -169,12 +169,11 @@ fn usage(prog: &str) {
     eprintln!("  --prompt <text>            System prompt for biasing");
     eprintln!("  --language <lang>          Force output language");
     eprintln!("\nAlignment mode (requires ForcedAligner model):");
-    eprintln!("  --align <text>             Align transcript to audio (word-level timestamps)");
+    eprintln!("  --align <text>             Align transcript to audio (word-level timestamps); off by default, supplying <text> activates alignment mode");
     eprintln!("  --align-language <lang>    Language for word splitting (default: English)");
     eprintln!("\nSubtitle output:");
     eprintln!("  --srt [path]  Write SRT subtitle file (default: <input>.srt); requires -i");
-    eprintln!("  --json        Emit JSON {{\"text\":..,\"segments\":[{{start,end,text}}]}} with per-segment");
-    eprintln!("                timestamps in seconds (Parakeet-compatible; suppresses token streaming)");
+    eprintln!("  --json        Emit JSON {{\"text\":..,\"segments\":[{{start,end,text}}]}} with per-segment timestamps in seconds (Parakeet-compatible; suppresses token streaming)");
     eprintln!("  --profile     Print per-operation timing breakdown");
     eprintln!("  --debug       Debug output (per-layer details)");
     eprintln!("  --silent      No status output (only transcription on stdout)");
@@ -438,9 +437,11 @@ fn main() {
     // --json prints one clean object on stdout: no live token streaming.
     let emit_tokens = verbosity > 0 && !json_output;
 
-    // Initialize thread pool
+    // Initialize thread pool. Default: all CPUs, capped at 10 (more threads give
+    // diminishing returns for the 0.6B model and add scheduling overhead). An
+    // explicit -t value is honored as-is.
     if n_threads <= 0 {
-        n_threads = kernels::get_num_cpus() as i32;
+        n_threads = (kernels::get_num_cpus() as i32).min(10);
     }
     kernels::set_threads(n_threads as usize);
 

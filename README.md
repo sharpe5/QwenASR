@@ -118,7 +118,7 @@ qwen-asr -d qwen3-asr-0.6b -i audio.wav --json         # JSON with per-segment t
 qwen-asr -d qwen3-asr-0.6b -i audio.wav --stream       # streaming
 qwen-asr -d qwen3-asr-0.6b --live --device "BlackHole 2ch"         # live capture (macOS)
 qwen-asr -d qwen3-asr-0.6b --live --vad --device "BlackHole 2ch"   # VAD live
-qwen-asr -d qwen3-aligner-0.6b -i audio.wav --align "Hello world" --align-language English  # alignment
+qwen-asr -d qwen3-aligner-0.6b -i audio.wav --align "Hello world" --align-language English  # alignment (see ALIGNMENT.md)
 ffmpeg -i video.mp4 -f s16le -ar 16000 -ac 1 - | qwen-asr -d qwen3-asr-0.6b --stdin        # raw PCM
 ```
 

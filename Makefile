@@ -4,6 +4,7 @@
 # Cargo binary name (crates/qwen-asr-cli produces `qwen-asr`).
 BIN        = qwen-asr
 RELEASE_BIN = target/release/$(BIN)
+DEBUG_BIN   = target/debug/$(BIN)
 
 # Crate version (the published CLI version), read from Cargo.toml.
 VERSION = $(shell grep -m1 '^version' crates/qwen-asr-cli/Cargo.toml | cut -d'"' -f2)
@@ -72,9 +73,15 @@ setup: release download
 # =============================================================================
 debug:
 	cargo build
+	@echo ""
+	@echo "Built debug binary: $(DEBUG_BIN)"
+	@echo "Run: ./$(DEBUG_BIN) -d $(MODEL) -i audio.wav"
 
 release:
 	cargo build --release
+	@echo ""
+	@echo "Built release binary: $(RELEASE_BIN)"
+	@echo "Run: ./$(RELEASE_BIN) -d $(MODEL) -i audio.wav"
 
 # Transcribe a file with the release binary. Requires a model and INPUT.
 #   make run MODEL_DIR=qwen3-asr-0.6b INPUT=audio.wav
