@@ -21,6 +21,40 @@ fn is_video_file(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve a model-directory argument to an existing path.
+///
+/// Used verbatim when it is absolute, or relative but already resolvable
+/// against the current working directory. Otherwise — typically a bare model
+/// name such as `qwen3-asr-0.6b` passed while the CLI is on `$PATH` and invoked
+/// from some unrelated directory — search relative to the BINARY's own
+/// location: its own directory first, then up to four parent directories
+/// (parent, parent², parent³, parent⁴). The first existing match wins; if none
+/// match, the original string is returned so the caller's download path can
+/// handle it (downloading into ./<name>/ as before).
+fn resolve_model_dir(given: String) -> String {
+    let p = std::path::Path::new(&given);
+    if p.is_absolute() || p.exists() {
+        return given;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        // Anchor at the binary's directory, then walk up: dir, parent, parent²,
+        // parent³, parent⁴ (five directories total).
+        let mut base = exe.parent().map(|d| d.to_path_buf());
+        for _ in 0..5 {
+            let dir = match base {
+                Some(d) => d,
+                None => break,
+            };
+            let candidate = dir.join(&given);
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+            base = dir.parent().map(|d| d.to_path_buf());
+        }
+    }
+    given
+}
+
 /// Extract audio from a video file using ffmpeg, returning 16 kHz mono f32 samples.
 fn extract_audio_from_video(path: &str) -> Option<Vec<f32>> {
     let output = std::process::Command::new("ffmpeg")
@@ -380,6 +414,12 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Resolve a relative model dir (e.g. a bare `qwen3-asr-0.6b`) against the
+    // binary's own location before deciding whether to download — so the CLI
+    // finds a model that sits alongside the install/source tree even when it is
+    // on $PATH and invoked from an unrelated working directory.
+    let model_dir = resolve_model_dir(model_dir);
 
     // Auto-prompt to download if model directory doesn't exist
     if !std::path::Path::new(&model_dir).exists() {
