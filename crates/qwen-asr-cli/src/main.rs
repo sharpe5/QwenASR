@@ -142,9 +142,11 @@ struct ClipFile {
 }
 
 /// Parse a `--clip-timestamps` file into `(start_ms, end_ms)` speech regions on
-/// the ORIGINAL file timeline. Two shapes are accepted:
-///   1. JSON (preferred): `{"speech":[{"start_ms":1500,"end_ms":42300}, ...]}`
-///   2. Whisper-style inline seconds list: `"s,e,s,e,…"` (comma-separated).
+/// the ORIGINAL file timeline. Three shapes are accepted:
+///   1. JSON envelope: `{"speech":[{"start_ms":1500,"end_ms":42300}, ...]}`
+///   2. JSON array of [start_s, end_s] pairs in SECONDS — the UNEDITED output of
+///      inaSpeechSegmenter / the mrecord audio2vad pre-pass: `[[1.2,5.8],[7.1,12.3]]`.
+///   3. Whisper-style inline seconds list: `"s,e,s,e,…"` (comma-separated).
 /// Regions are returned in file order; degenerate (`end <= start`) spans are
 /// dropped.
 fn parse_clip_timestamps(path: &str) -> Result<Vec<(u64, u64)>, String> {
@@ -170,6 +172,26 @@ fn parse_clip_content(content: &str) -> Result<Vec<(u64, u64)>, String> {
         for r in parsed.speech {
             let s_ms = r.start_ms.max(0.0).round() as u64;
             let e_ms = r.end_ms.max(0.0).round() as u64;
+            if e_ms > s_ms {
+                regions.push((s_ms, e_ms));
+            }
+        }
+        Ok(regions)
+    } else if trimmed.starts_with('[') {
+        // JSON array of [start_s, end_s] pairs in SECONDS — inaSpeechSegmenter's
+        // unedited output (mrecord audio2vad pre-pass): [[1.2,5.8],[7.1,12.3]].
+        let pairs: Vec<Vec<f64>> = serde_json::from_str(trimmed)
+            .map_err(|e| format!("invalid JSON pairs array ({})", e))?;
+        let mut regions = Vec::with_capacity(pairs.len());
+        for p in pairs {
+            if p.len() != 2 {
+                return Err(format!(
+                    "expected [start_s, end_s] pairs, got a sub-array of length {}",
+                    p.len()
+                ));
+            }
+            let s_ms = (p[0].max(0.0) * 1000.0).round() as u64;
+            let e_ms = (p[1].max(0.0) * 1000.0).round() as u64;
             if e_ms > s_ms {
                 regions.push((s_ms, e_ms));
             }
@@ -290,7 +312,7 @@ fn usage(prog: &str) {
     eprintln!("\nSubtitle output:");
     opt("--srt [path]", "Write SRT subtitle file (default path: <input>.srt); requires -i (default: off)");
     opt("--json", "Emit JSON {\"text\":..,\"segments\":[{start,end,text}]} with per-segment timestamps in seconds (Parakeet-compatible; suppresses token streaming) (default: off)");
-    opt("--clip-timestamps <path>", "VAD-driven transcription: transcribe ONLY the speech regions in <path>, skipping silence/music, in one model load. Feed it the output of a VAD/segmenter pre-pass (e.g. inaSpeechSegmenter) as JSON {\"speech\":[{\"start_ms\":..,\"end_ms\":..}]} or a \"s,e,s,e,…\" seconds list. Segment times are re-based to the original file timeline. Affects --json/--srt (default: off)");
+    opt("--clip-timestamps <path>", "VAD-driven transcription: transcribe ONLY the speech regions in <path>, skipping silence/music, in one model load. Feed it the output of a VAD/segmenter pre-pass (e.g. inaSpeechSegmenter) as JSON {\"speech\":[{\"start_ms\":..,\"end_ms\":..}]}, the unedited [[start_s,end_s],…] seconds-pairs array, or a \"s,e,s,e,…\" seconds list. Segment times are re-based to the original file timeline. Affects --json/--srt (default: off)");
     opt("--profile", "Print per-operation timing breakdown (default: off)");
     opt("--debug", "Debug output (per-layer details) (default: off)");
     opt("--silent", "No status output (only transcription on stdout) (default: off)");
@@ -1445,6 +1467,19 @@ mod tests {
         // A region missing end_ms fails deserialization (both fields required).
         let s = r#"{"speech":[{"start_ms":1000,"end_ms":2000},{"start_ms":3000}]}"#;
         assert!(parse_clip_content(s).is_err());
+    }
+
+    #[test]
+    fn parse_pairs_array_seconds() {
+        // inaSpeechSegmenter's unedited output: [[start_s, end_s], ...] in SECONDS.
+        let s = "[[1.2, 5.8], [7.1, 12.3]]";
+        assert_eq!(parse_clip_content(s).unwrap(), vec![(1200, 5800), (7100, 12300)]);
+    }
+
+    #[test]
+    fn parse_pairs_array_drops_degenerate_and_errors_on_bad_arity() {
+        assert_eq!(parse_clip_content("[[1.0,1.0],[2.0,3.0]]").unwrap(), vec![(2000, 3000)]);
+        assert!(parse_clip_content("[[1.0,2.0,3.0]]").is_err());
     }
 
     #[test]
