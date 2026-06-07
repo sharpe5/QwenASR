@@ -420,34 +420,37 @@ pub struct TranscriptSegment {
     pub text: String,
 }
 
-/// Transcribe audio and return per-segment results with timestamps.
+/// Transcribe one contiguous slice of already-decoded audio into ≤`segment_sec`
+/// sub-chunks, appending each transcribed sub-chunk to `out` with timestamps
+/// rebased by `base_ms`.
 ///
-/// Unlike [`transcribe_audio`], this function preserves the original audio
-/// timeline (no silence compaction) so that `start_ms`/`end_ms` are accurate
-/// for subtitle generation.  Each segment's duration is used to set the token
-/// budget, so accuracy is not sacrificed for long files.
+/// This is the shared core of [`transcribe_segmented`] (one slice covering the
+/// whole file, `base_ms = 0`) and [`transcribe_clips`] (one slice per speech
+/// region, `base_ms = region_start_ms`). It performs NO model loading or audio
+/// decoding — the caller owns the loaded tokenizer and the decoded `samples`.
 ///
-/// Uses `ctx.segment_sec` for splitting; falls back to 30 s if unset.
-pub fn transcribe_segmented(ctx: &mut QwenCtx, samples: &[f32]) -> Option<Vec<TranscriptSegment>> {
-    ctx.reset_perf();
-
-    let tokenizer = load_tokenizer(&ctx.model_dir)?;
-    if !ctx.prepare_prompt_tokens(&tokenizer) {
-        return None;
-    }
-
+/// The ~`segment_sec` (default 30 s) sub-chunking is the decoder-repetition
+/// guard: long spans make the model loop, so they are split at low-energy
+/// boundaries. Sub-chunk timestamps are derived from in-slice sample offsets and
+/// shifted by `base_ms`, so a region never produces a segment spanning a skipped
+/// gap.
+fn segment_slice(
+    ctx: &mut QwenCtx,
+    samples: &[f32],
+    tokenizer: &QwenTokenizer,
+    base_ms: u64,
+    out: &mut Vec<TranscriptSegment>,
+) {
     let segment_sec = if ctx.segment_sec > 0.0 { ctx.segment_sec } else { 30.0 };
     let search_sec = ctx.search_sec.min(segment_sec / 2.0);
     let target_samples = (segment_sec * SAMPLE_RATE as f32) as usize;
     let margin_samples = (search_sec * SAMPLE_RATE as f32) as usize;
     let min_samples = SAMPLE_RATE as usize / 2;
 
-    let mut segments: Vec<TranscriptSegment> = Vec::new();
-
     if samples.len() <= target_samples + margin_samples {
         let seg_end = samples.len();
-        let start_ms = 0u64;
-        let end_ms = (seg_end as u64 * 1000) / SAMPLE_RATE as u64;
+        let start_ms = base_ms;
+        let end_ms = base_ms + (seg_end as u64 * 1000) / SAMPLE_RATE as u64;
         ctx.perf_audio_ms = 1000.0 * seg_end as f64 / SAMPLE_RATE as f64;
         let seg_buf: Vec<f32>;
         let seg_ptr = if seg_end < min_samples {
@@ -460,15 +463,15 @@ pub fn transcribe_segmented(ctx: &mut QwenCtx, samples: &[f32]) -> Option<Vec<Tr
         } else {
             samples
         };
-        if let Some((text, _)) = transcribe_segment(ctx, seg_ptr, &tokenizer, None) {
+        if let Some((text, _)) = transcribe_segment(ctx, seg_ptr, tokenizer, None) {
             if !text.is_empty() {
-                segments.push(TranscriptSegment { start_ms, end_ms, text });
+                out.push(TranscriptSegment { start_ms, end_ms, text });
             }
         }
-        return Some(segments);
+        return;
     }
 
-    // Build split points over the original (uncompacted) samples
+    // Build split points over the slice
     let mut splits = vec![0usize];
     let mut pos = 0;
     while pos + target_samples + margin_samples < samples.len() {
@@ -486,8 +489,8 @@ pub fn transcribe_segmented(ctx: &mut QwenCtx, samples: &[f32]) -> Option<Vec<Tr
         let seg_end = if s + 1 < n_splits { splits[s + 1] } else { samples.len() };
         let seg_len = seg_end - seg_start;
 
-        let start_ms = (seg_start as u64 * 1000) / SAMPLE_RATE as u64;
-        let end_ms = (seg_end as u64 * 1000) / SAMPLE_RATE as u64;
+        let start_ms = base_ms + (seg_start as u64 * 1000) / SAMPLE_RATE as u64;
+        let end_ms = base_ms + (seg_end as u64 * 1000) / SAMPLE_RATE as u64;
 
         // Set perf_audio_ms to this segment's duration so the token budget
         // is per-segment, not the full file (avoids the 6-token fast-cap).
@@ -505,7 +508,7 @@ pub fn transcribe_segmented(ctx: &mut QwenCtx, samples: &[f32]) -> Option<Vec<Tr
             &samples[seg_start..seg_end]
         };
 
-        let (text, _) = match transcribe_segment(ctx, seg_ptr, &tokenizer, None) {
+        let (text, _) = match transcribe_segment(ctx, seg_ptr, tokenizer, None) {
             Some(r) => r,
             None => continue,
         };
@@ -514,10 +517,121 @@ pub fn transcribe_segmented(ctx: &mut QwenCtx, samples: &[f32]) -> Option<Vec<Tr
             continue;
         }
 
-        segments.push(TranscriptSegment { start_ms, end_ms, text });
+        out.push(TranscriptSegment { start_ms, end_ms, text });
+    }
+}
+
+/// Transcribe audio and return per-segment results with timestamps.
+///
+/// Unlike [`transcribe_audio`], this function preserves the original audio
+/// timeline (no silence compaction) so that `start_ms`/`end_ms` are accurate
+/// for subtitle generation.  Each segment's duration is used to set the token
+/// budget, so accuracy is not sacrificed for long files.
+///
+/// Uses `ctx.segment_sec` for splitting; falls back to 30 s if unset.
+pub fn transcribe_segmented(ctx: &mut QwenCtx, samples: &[f32]) -> Option<Vec<TranscriptSegment>> {
+    ctx.reset_perf();
+
+    let tokenizer = load_tokenizer(&ctx.model_dir)?;
+    if !ctx.prepare_prompt_tokens(&tokenizer) {
+        return None;
+    }
+
+    let mut segments: Vec<TranscriptSegment> = Vec::new();
+    segment_slice(ctx, samples, &tokenizer, 0, &mut segments);
+    Some(segments)
+}
+
+/// Transcribe only the listed speech regions of already-decoded audio, in a
+/// single model load / single decode, returning per-segment timestamps rebased
+/// to the ORIGINAL file timeline.
+///
+/// `regions` are `(start_ms, end_ms)` spans on the original timeline, expected
+/// sorted and non-overlapping (as produced by a VAD/music pre-pass). For each
+/// region the corresponding slice of `samples` is transcribed via
+/// [`segment_slice`] — internal ≤`ctx.segment_sec` sub-chunking is preserved,
+/// and region boundaries never trigger a reload or re-decode. Everything outside
+/// the listed regions is skipped, and no segment spans a skipped gap.
+pub fn transcribe_clips(
+    ctx: &mut QwenCtx,
+    samples: &[f32],
+    regions: &[(u64, u64)],
+) -> Option<Vec<TranscriptSegment>> {
+    ctx.reset_perf();
+
+    let tokenizer = load_tokenizer(&ctx.model_dir)?;
+    if !ctx.prepare_prompt_tokens(&tokenizer) {
+        return None;
+    }
+
+    let n = samples.len();
+    let mut segments: Vec<TranscriptSegment> = Vec::new();
+
+    for &(region_start_ms, region_end_ms) in regions {
+        // Map the original-timeline region to in-buffer sample offsets, clamped
+        // to the decoded audio (a trailing region may extend past EOF).
+        let (start_sample, end_sample) = match region_to_samples(region_start_ms, region_end_ms, n) {
+            Some(r) => r,
+            None => continue,
+        };
+
+        // base_ms is the region's original-timeline start; in-slice offsets are
+        // added on top, so segment times land on the original file timeline.
+        segment_slice(
+            ctx,
+            &samples[start_sample..end_sample],
+            &tokenizer,
+            region_start_ms,
+            &mut segments,
+        );
     }
 
     Some(segments)
+}
+
+/// Map an original-timeline `(start_ms, end_ms)` region to clamped in-buffer
+/// sample offsets `[start, end)` within a buffer of `n_samples`. Returns `None`
+/// when the region is empty after clamping (e.g. entirely past end-of-file).
+fn region_to_samples(start_ms: u64, end_ms: u64, n_samples: usize) -> Option<(usize, usize)> {
+    let start = ((start_ms.saturating_mul(SAMPLE_RATE as u64)) / 1000) as usize;
+    let end = ((end_ms.saturating_mul(SAMPLE_RATE as u64)) / 1000) as usize;
+    let start = start.min(n_samples);
+    let end = end.min(n_samples);
+    if end <= start {
+        None
+    } else {
+        Some((start, end))
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    const SR: usize = SAMPLE_RATE as usize; // samples per second
+
+    #[test]
+    fn region_maps_ms_to_samples() {
+        // 1500ms..2500ms at 16kHz -> 24000..40000.
+        assert_eq!(region_to_samples(1500, 2500, SR * 10), Some((24_000, 40_000)));
+    }
+
+    #[test]
+    fn region_clamps_to_end_of_buffer() {
+        // Buffer is only 1s long; a region from 0.5s..5s clamps its end to 1s.
+        assert_eq!(region_to_samples(500, 5000, SR), Some((SR / 2, SR)));
+    }
+
+    #[test]
+    fn region_entirely_past_eof_is_none() {
+        // Buffer 1s long; region starts at 2s -> nothing to transcribe.
+        assert_eq!(region_to_samples(2000, 3000, SR), None);
+    }
+
+    #[test]
+    fn region_zero_width_is_none() {
+        assert_eq!(region_to_samples(1000, 1000, SR * 10), None);
+    }
 }
 
 /// Transcribe audio samples (f32, 16 kHz, mono, range [-1, 1]).

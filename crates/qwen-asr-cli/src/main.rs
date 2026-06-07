@@ -127,6 +127,80 @@ fn format_srt(segments: &[transcribe::TranscriptSegment]) -> String {
     out
 }
 
+/// One speech region from a `--clip-timestamps` JSON file, in milliseconds on
+/// the original file timeline.
+#[derive(serde::Deserialize)]
+struct ClipRegion {
+    start_ms: f64,
+    end_ms: f64,
+}
+
+/// The `{"speech":[...]}` envelope produced by a VAD/segmenter pre-pass.
+#[derive(serde::Deserialize)]
+struct ClipFile {
+    speech: Vec<ClipRegion>,
+}
+
+/// Parse a `--clip-timestamps` file into `(start_ms, end_ms)` speech regions on
+/// the ORIGINAL file timeline. Two shapes are accepted:
+///   1. JSON (preferred): `{"speech":[{"start_ms":1500,"end_ms":42300}, ...]}`
+///   2. Whisper-style inline seconds list: `"s,e,s,e,…"` (comma-separated).
+/// Regions are returned in file order; degenerate (`end <= start`) spans are
+/// dropped.
+fn parse_clip_timestamps(path: &str) -> Result<Vec<(u64, u64)>, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read {}: {}", path, e))?;
+    parse_clip_content(&content)
+}
+
+/// Parse the textual contents of a clip-timestamps file. Split out from
+/// [`parse_clip_timestamps`] so the parsing logic is unit-testable without
+/// touching the filesystem.
+fn parse_clip_content(content: &str) -> Result<Vec<(u64, u64)>, String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("file is empty".to_string());
+    }
+
+    if trimmed.starts_with('{') {
+        // JSON envelope {"speech":[{"start_ms":..,"end_ms":..}, ...]}.
+        let parsed: ClipFile = serde_json::from_str(trimmed)
+            .map_err(|e| format!("invalid JSON ({})", e))?;
+        let mut regions = Vec::with_capacity(parsed.speech.len());
+        for r in parsed.speech {
+            let s_ms = r.start_ms.max(0.0).round() as u64;
+            let e_ms = r.end_ms.max(0.0).round() as u64;
+            if e_ms > s_ms {
+                regions.push((s_ms, e_ms));
+            }
+        }
+        Ok(regions)
+    } else {
+        // Whisper-style inline list of seconds: s,e,s,e,…
+        let nums: Vec<f64> = trimmed
+            .split(',')
+            .filter_map(|t| {
+                let t = t.trim();
+                if t.is_empty() { None } else { t.parse::<f64>().ok() }
+            })
+            .collect();
+        if nums.is_empty() || nums.len() % 2 != 0 {
+            return Err(
+                "expected an even-length comma-separated seconds list \"s,e,s,e,…\"".to_string(),
+            );
+        }
+        let mut regions = Vec::with_capacity(nums.len() / 2);
+        for pair in nums.chunks_exact(2) {
+            let s_ms = (pair[0].max(0.0) * 1000.0).round() as u64;
+            let e_ms = (pair[1].max(0.0) * 1000.0).round() as u64;
+            if e_ms > s_ms {
+                regions.push((s_ms, e_ms));
+            }
+        }
+        Ok(regions)
+    }
+}
+
 /// Escape a string for inclusion in a JSON string literal.
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -191,6 +265,7 @@ fn usage(prog: &str) {
     opt("-d <dir>", "Model directory (with *.safetensors, vocab.json)");
     opt("-i <file>", "Input file: WAV (16-bit PCM) or video (mp4/mkv/mov/…, requires ffmpeg)");
     opt("--stdin", "Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)");
+    opt("--language <lang>", "Output language (REQUIRED). See note and language list below.");
     eprintln!("\nLive capture (macOS only):");
     opt("--live", "Capture from audio input device in real time (default: off)");
     opt("--device <name>", "Input device name (default: system default)");
@@ -198,7 +273,7 @@ fn usage(prog: &str) {
     opt("--vad", "Live VAD mode: detect speech segments, transcribe each (default: off)");
     eprintln!("\nOptions:");
     opt("-t <n>", "Number of threads (default: all CPUs, capped at 10)");
-    opt("-S <secs>", "Segment target seconds (default: 30; 0 = full-audio decode)");
+    opt("-S <secs>", "Segment target seconds (default: 30; 0 = full-audio decode). Audio is split into ~30s segments because decoding longer spans makes the model loop and repeat itself; keep this near 30 unless you know what you're doing.");
     opt("-W <secs>", "Segment-cutting silence search window ± seconds (default: 3.0)");
     opt("--stream", "Streaming mode: process in chunks with prefix rollback (default: off)");
     opt("--stream-max-new-tokens <n>", "Max generated tokens per stream step (default: 32)");
@@ -207,13 +282,15 @@ fn usage(prog: &str) {
     opt("--past-text <yes|no|auto>", "Reuse previously decoded text as context (default: auto — yes for --stream, else no)");
     opt("--skip-silence", "Drop long silent spans before inference (default: off)");
     opt("--prompt <text>", "System prompt for biasing (default: none)");
-    opt("--language <lang>", "Force output language (default: auto-detect)");
+    opt("--language <lang>", "Force output language (REQUIRED). The audio is decoded in ~30s segments to avoid repetition loops, and the model re-detects the language on each segment independently — so without a fixed language it guesses wrong on some blocks and quality suffers. Set this to lock the language for the whole file.");
+    opt("", &format!("Valid languages: {}", SUPPORTED_LANGUAGES.join(", ")));
     eprintln!("\nAlignment mode (requires ForcedAligner model):");
     opt("--align <text>", "Align transcript to audio (word-level timestamps); supply <text> to activate (default: off)");
     opt("--align-language <lang>", "Language for word splitting (default: English)");
     eprintln!("\nSubtitle output:");
     opt("--srt [path]", "Write SRT subtitle file (default path: <input>.srt); requires -i (default: off)");
     opt("--json", "Emit JSON {\"text\":..,\"segments\":[{start,end,text}]} with per-segment timestamps in seconds (Parakeet-compatible; suppresses token streaming) (default: off)");
+    opt("--clip-timestamps <path>", "VAD-driven transcription: transcribe ONLY the speech regions in <path>, skipping silence/music, in one model load. Feed it the output of a VAD/segmenter pre-pass (e.g. inaSpeechSegmenter) as JSON {\"speech\":[{\"start_ms\":..,\"end_ms\":..}]} or a \"s,e,s,e,…\" seconds list. Segment times are re-based to the original file timeline. Affects --json/--srt (default: off)");
     opt("--profile", "Print per-operation timing breakdown (default: off)");
     opt("--debug", "Debug output (per-layer details) (default: off)");
     opt("--silent", "No status output (only transcription on stdout) (default: off)");
@@ -286,6 +363,7 @@ fn main() {
     let mut srt_path: Option<String> = None;
     let mut srt_requested = false;
     let mut json_output = false;
+    let mut clip_timestamps: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -372,6 +450,10 @@ fn main() {
             "--json" => {
                 json_output = true;
             }
+            "--clip-timestamps" => {
+                i += 1;
+                clip_timestamps = args.get(i).cloned();
+            }
             "--stdin" => {
                 use_stdin = true;
             }
@@ -451,6 +533,53 @@ fn main() {
     let input_count = [input_wav.is_some(), use_stdin, live_mode].iter().filter(|&&x| x).count();
     if input_count > 1 {
         eprintln!("Error: -i, --stdin, and --live are mutually exclusive");
+        std::process::exit(1);
+    }
+
+    // Parse --clip-timestamps up front (fail fast on a bad file). Regions are
+    // (start_ms, end_ms) on the original timeline; the audio is still loaded and
+    // decoded once, then only these regions are transcribed (re-based to the
+    // original timeline). Only the --json / --srt timestamped paths consume it.
+    let clip_regions: Option<Vec<(u64, u64)>> = match clip_timestamps {
+        Some(ref path) => {
+            if live_mode {
+                eprintln!("Error: --clip-timestamps cannot be used with --live");
+                std::process::exit(1);
+            }
+            if !json_output && !srt_requested {
+                eprintln!(
+                    "Error: --clip-timestamps requires a timestamped output mode (--json or --srt)"
+                );
+                std::process::exit(1);
+            }
+            match parse_clip_timestamps(path) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    eprintln!("Error: --clip-timestamps {}: {}", path, e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Require an explicit --language for transcription. The audio is decoded in
+    // ~30s segments to avoid repetition loops, and the model re-detects the
+    // language on each segment independently — so without a fixed language it
+    // guesses wrong on some blocks and quality suffers. Alignment mode has its
+    // own --align-language and does not transcribe, so it is exempt.
+    if align_text.is_none() && force_language.is_none() {
+        eprintln!("Error: --language <lang> is required.");
+        eprintln!(
+            "  Audio is decoded in ~30s segments to avoid repetition loops, and the model"
+        );
+        eprintln!(
+            "  re-detects the language on each segment — without a fixed language it guesses"
+        );
+        eprintln!(
+            "  wrong on some segments and quality suffers. Pass --language to lock it."
+        );
+        eprintln!("  Supported languages: {}", SUPPORTED_LANGUAGES.join(","));
         std::process::exit(1);
     }
 
@@ -651,7 +780,11 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        let segments = match transcribe::transcribe_segmented(&mut ctx, &samples) {
+        let segments = match clip_regions {
+            Some(ref regions) => transcribe::transcribe_clips(&mut ctx, &samples, regions),
+            None => transcribe::transcribe_segmented(&mut ctx, &samples),
+        };
+        let segments = match segments {
             Some(s) => s,
             None => {
                 eprintln!("Transcription failed");
@@ -693,7 +826,11 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        let segments = match transcribe::transcribe_segmented(&mut ctx, &samples) {
+        let segments = match clip_regions {
+            Some(ref regions) => transcribe::transcribe_clips(&mut ctx, &samples, regions),
+            None => transcribe::transcribe_segmented(&mut ctx, &samples),
+        };
+        let segments = match segments {
             Some(s) => s,
             None => {
                 eprintln!("Transcription failed");
@@ -1268,5 +1405,74 @@ fn run_live_capture(
 
     if profile {
         kernels::profile_report();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_json_tolerates_whitespace() {
+        let s = "{ \"speech\" : [ { \"start_ms\" : 1500 , \"end_ms\" : 42300 } ] }";
+        assert_eq!(parse_clip_content(s).unwrap(), vec![(1500, 42300)]);
+    }
+
+    #[test]
+    fn parse_json_invalid_errors() {
+        assert!(parse_clip_content(r#"{"speech":[{"start_ms":1500"#).is_err());
+    }
+
+    #[test]
+    fn parse_json_multiple_regions_in_order() {
+        let s = r#"{"speech":[{"start_ms":1500,"end_ms":42300},
+                              {"start_ms":58000,"end_ms":131200}]}"#;
+        let r = parse_clip_content(s).unwrap();
+        assert_eq!(r, vec![(1500, 42300), (58000, 131200)]);
+    }
+
+    #[test]
+    fn parse_json_rounds_and_drops_degenerate() {
+        // 1000.6 -> 1001, 2000.4 -> 2000; second region end == start is dropped.
+        let s = r#"{"speech":[{"start_ms":1000.6,"end_ms":2000.4},
+                              {"start_ms":3000,"end_ms":3000}]}"#;
+        let r = parse_clip_content(s).unwrap();
+        assert_eq!(r, vec![(1001, 2000)]);
+    }
+
+    #[test]
+    fn parse_json_missing_field_errors() {
+        // A region missing end_ms fails deserialization (both fields required).
+        let s = r#"{"speech":[{"start_ms":1000,"end_ms":2000},{"start_ms":3000}]}"#;
+        assert!(parse_clip_content(s).is_err());
+    }
+
+    #[test]
+    fn parse_json_empty_speech_is_ok() {
+        // A valid envelope with no speech regions -> nothing to transcribe.
+        assert_eq!(parse_clip_content(r#"{"speech":[]}"#).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn parse_empty_errors() {
+        assert!(parse_clip_content("   \n  ").is_err());
+    }
+
+    #[test]
+    fn parse_seconds_list() {
+        // 1.5s,42.3s -> ms; 58s,131.2s -> ms.
+        let r = parse_clip_content("1.5,42.3,58,131.2").unwrap();
+        assert_eq!(r, vec![(1500, 42300), (58000, 131200)]);
+    }
+
+    #[test]
+    fn parse_seconds_list_with_spaces() {
+        let r = parse_clip_content(" 1.0, 2.0 , 3.0, 4.0 ").unwrap();
+        assert_eq!(r, vec![(1000, 2000), (3000, 4000)]);
+    }
+
+    #[test]
+    fn parse_seconds_list_odd_length_errors() {
+        assert!(parse_clip_content("1.0,2.0,3.0").is_err());
     }
 }

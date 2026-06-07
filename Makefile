@@ -81,20 +81,21 @@ release:
 	cargo build --release
 	@echo ""
 	@echo "Built release binary: $(RELEASE_BIN)"
-	@echo "Run: ./$(RELEASE_BIN) -d $(MODEL) -i audio.wav"
+	@echo "Run: ./$(RELEASE_BIN) -d $(MODEL) -i audio.wav --language English"
 
-# Transcribe a file with the release binary. Requires a model and INPUT.
-#   make run MODEL_DIR=qwen3-asr-0.6b INPUT=audio.wav
+# Transcribe a file with the release binary. Requires a model, INPUT, and LANGUAGE.
+#   make run MODEL_DIR=qwen3-asr-0.6b INPUT=audio.wav LANGUAGE=English
 INPUT ?=
+LANGUAGE ?= English
 run: release
 	@test -n "$(MODEL_DIR)" || { \
 	  echo "No model dir found (looked for qwen3-asr-1.7b / qwen3-asr-0.6b)."; \
 	  echo "Download one:   make download                     # Qwen3-ASR-0.6B (default)"; \
 	  echo "          or:   make download MODEL=qwen3-asr-1.7b  # Qwen3-ASR-1.7B"; \
-	  echo "Use existing:   make run MODEL_DIR=/path/to/model INPUT=audio.wav"; \
+	  echo "Use existing:   make run MODEL_DIR=/path/to/model INPUT=audio.wav LANGUAGE=English"; \
 	  exit 1; }
 	@test -n "$(INPUT)" || { echo "Set INPUT: make run INPUT=audio.wav"; exit 1; }
-	./$(RELEASE_BIN) -d "$(MODEL_DIR)" -i "$(INPUT)"
+	./$(RELEASE_BIN) -d "$(MODEL_DIR)" -i "$(INPUT)" --language "$(LANGUAGE)"
 
 # =============================================================================
 # Test / quality

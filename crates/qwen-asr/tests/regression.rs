@@ -230,6 +230,80 @@ fn test_streaming_audio_wav() {
         "audio.wav streaming: Levenshtein distance {} > 10\nExpected: {}\nGot: {}", dist, reference, text);
 }
 
+/// `--clip-timestamps`: segment times must land on the ORIGINAL file timeline
+/// and never span a skipped gap between regions.
+#[test]
+fn test_clip_timestamps_rebasing() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ctx = match setup_model() {
+        Some(c) => c,
+        None => return,
+    };
+    let wav = "bench/samples/audio.wav"; // ~28 s
+    if !std::path::Path::new(wav).exists() {
+        eprintln!("Skipping: {} not found", wav);
+        return;
+    }
+    let samples = qwen_asr::audio::load_wav(wav).expect("load audio");
+
+    // Two disjoint regions with a skipped 6 s..12 s gap between them.
+    let regions = vec![(2_000u64, 6_000u64), (12_000u64, 18_000u64)];
+    let segs = transcribe::transcribe_clips(&mut ctx, &samples, &regions)
+        .expect("clip transcription should succeed");
+    assert!(!segs.is_empty(), "should produce at least one segment");
+
+    // Every segment must fall ENTIRELY inside one requested region — proving the
+    // times are re-based to the original timeline and no segment spans the gap.
+    for s in &segs {
+        assert!(s.start_ms < s.end_ms, "start {} !< end {}", s.start_ms, s.end_ms);
+        let in_a = s.start_ms >= 2_000 && s.end_ms <= 6_000;
+        let in_b = s.start_ms >= 12_000 && s.end_ms <= 18_000;
+        assert!(
+            in_a || in_b,
+            "segment {}..{} lands outside the requested regions",
+            s.start_ms, s.end_ms
+        );
+    }
+
+    // Times are non-decreasing across segments (chronological order).
+    for i in 1..segs.len() {
+        assert!(
+            segs[i].start_ms >= segs[i - 1].start_ms,
+            "non-monotonic segment times at index {}",
+            i
+        );
+    }
+}
+
+/// `--clip-timestamps`: a single region spanning the whole file must produce
+/// byte-for-byte the same segments as the plain full-file decode.
+#[test]
+fn test_clip_single_region_matches_full_file() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ctx = match setup_model() {
+        Some(c) => c,
+        None => return,
+    };
+    let wav = "bench/samples/audio.wav";
+    if !std::path::Path::new(wav).exists() {
+        eprintln!("Skipping: {} not found", wav);
+        return;
+    }
+    let samples = qwen_asr::audio::load_wav(wav).expect("load audio");
+
+    let full = transcribe::transcribe_segmented(&mut ctx, &samples).expect("full decode");
+    // End far past EOF so the region clamps to the whole buffer (start at 0).
+    let clip = transcribe::transcribe_clips(&mut ctx, &samples, &[(0, 1_000_000_000)])
+        .expect("clip decode");
+
+    assert_eq!(clip.len(), full.len(), "segment count must match full-file decode");
+    for (c, f) in clip.iter().zip(full.iter()) {
+        assert_eq!(c.start_ms, f.start_ms, "start_ms must match full-file decode");
+        assert_eq!(c.end_ms, f.end_ms, "end_ms must match full-file decode");
+        assert_eq!(c.text, f.text, "text must match full-file decode");
+    }
+}
+
 fn setup_aligner_model() -> Option<QwenCtx> {
     let model_dir = "qwen3-aligner-0.6b";
     if !std::path::Path::new(model_dir).join("model.safetensors").exists() {
