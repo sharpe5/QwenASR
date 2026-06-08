@@ -51,6 +51,10 @@ pub struct Decoder {
     /// INT8 quantized lm_head weights for fast argmax
     pub lm_head_int8: Option<Vec<i8>>,
     pub lm_head_int8_scales: Option<Vec<f32>>,
+    /// When true, prefill widens BF16 weights to f32 per call instead of using the
+    /// resident `*_f32_prefill` copies (which are left empty to save ~halve the weight
+    /// RAM). Single-token decode (int8/bf16 matvec) is unaffected. Set via `--weights bf16`.
+    pub weights_bf16: bool,
 }
 
 unsafe impl Send for Decoder {}
@@ -89,7 +93,7 @@ fn load_bf16_as_f32(
 }
 
 impl Decoder {
-    pub fn load(ms: &MultiSafetensors, cfg: &QwenConfig) -> Option<Self> {
+    pub fn load(ms: &MultiSafetensors, cfg: &QwenConfig, weights_bf16: bool) -> Option<Self> {
         let tok_embeddings_bf16 = load_bf16_direct(ms, "thinker.model.embed_tokens.weight")?;
 
         let mut layers = Vec::new();
@@ -105,30 +109,19 @@ impl Decoder {
             let hidden = cfg.dec_hidden;
             let inter = cfg.dec_intermediate;
 
-            let wq_weight_f32_prefill = load_bf16_as_f32(
-                ms,
-                &format!("{}.self_attn.q_proj.weight", lp),
-                q_dim,
-                hidden,
-            )?;
-            let wk_weight_f32_prefill = load_bf16_as_f32(
-                ms,
-                &format!("{}.self_attn.k_proj.weight", lp),
-                kv_dim,
-                hidden,
-            )?;
-            let wv_weight_f32_prefill = load_bf16_as_f32(
-                ms,
-                &format!("{}.self_attn.v_proj.weight", lp),
-                kv_dim,
-                hidden,
-            )?;
-            let wo_weight_f32_prefill = load_bf16_as_f32(
-                ms,
-                &format!("{}.self_attn.o_proj.weight", lp),
-                hidden,
-                q_dim,
-            )?;
+            // In BF16-resident mode the prefill widens from the BF16 pointers per call,
+            // so these full f32 copies are skipped (the main RAM saving).
+            let (wq_weight_f32_prefill, wk_weight_f32_prefill,
+                 wv_weight_f32_prefill, wo_weight_f32_prefill) = if weights_bf16 {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            } else {
+                (
+                    load_bf16_as_f32(ms, &format!("{}.self_attn.q_proj.weight", lp), q_dim, hidden)?,
+                    load_bf16_as_f32(ms, &format!("{}.self_attn.k_proj.weight", lp), kv_dim, hidden)?,
+                    load_bf16_as_f32(ms, &format!("{}.self_attn.v_proj.weight", lp), kv_dim, hidden)?,
+                    load_bf16_as_f32(ms, &format!("{}.self_attn.o_proj.weight", lp), hidden, q_dim)?,
+                )
+            };
 
             let q_norm = load_f32(ms, &format!("{}.self_attn.q_norm.weight", lp))?;
             let k_norm = load_f32(ms, &format!("{}.self_attn.k_norm.weight", lp))?;
@@ -151,10 +144,15 @@ impl Decoder {
                         .copy_from_slice(&up_slice[r * hidden..(r + 1) * hidden]);
                 }
             }
-            let mut gate_up_fused_f32_prefill = vec![0.0f32; 2 * inter * hidden];
-            kernels::bf16_to_f32_buf(&mut gate_up_fused_f32_prefill, &gate_up_fused);
-            let down_weight_f32_prefill =
-                load_bf16_as_f32(ms, &format!("{}.mlp.down_proj.weight", lp), hidden, inter)?;
+            // Skip the f32 prefill copies in BF16-resident mode (widened per call instead).
+            let (gate_up_fused_f32_prefill, down_weight_f32_prefill) = if weights_bf16 {
+                (Vec::new(), Vec::new())
+            } else {
+                let mut gate_up = vec![0.0f32; 2 * inter * hidden];
+                kernels::bf16_to_f32_buf(&mut gate_up, &gate_up_fused);
+                let down = load_bf16_as_f32(ms, &format!("{}.mlp.down_proj.weight", lp), hidden, inter)?;
+                (gate_up, down)
+            };
 
             // INT8 quantize all decoder layer weights
             let (wq_int8, wq_int8_scales) =
@@ -229,6 +227,7 @@ impl Decoder {
             lm_head_bf16,
             lm_head_int8: Some(lm_int8),
             lm_head_int8_scales: Some(lm_scales),
+            weights_bf16,
         })
     }
 }
@@ -521,6 +520,20 @@ impl DecoderBuffers {
     }
 }
 
+/// Prefill matmul that picks the resident f32 copy or widens the BF16 pointer per call,
+/// per the `weights_bf16` switch. In BF16 mode `w_f32` is empty and unused; in f32 mode
+/// `w_bf16` is valid but unused.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn prefill_linear(weights_bf16: bool, y: &mut [f32], x: &[f32], w_f32: &[f32],
+                  w_bf16: *const u16, seq: usize, in_dim: usize, out_dim: usize) {
+    if weights_bf16 {
+        kernels::linear_nobias_bf16(y, x, w_bf16, seq, in_dim, out_dim);
+    } else {
+        kernels::linear_nobias(y, x, w_f32, seq, in_dim, out_dim);
+    }
+}
+
 /// Decoder prefill: process multiple tokens.
 pub fn decoder_prefill(
     decoder: &Decoder,
@@ -574,23 +587,10 @@ pub fn decoder_prefill(
         let k = &mut bufs.pref_k[..seq_len * kv_dim];
         let v = &mut bufs.pref_v[..seq_len * kv_dim];
 
-        kernels::linear_nobias(q, x_norm, &layer.wq_weight_f32_prefill, seq_len, dim, q_dim);
-        kernels::linear_nobias(
-            k,
-            x_norm,
-            &layer.wk_weight_f32_prefill,
-            seq_len,
-            dim,
-            kv_dim,
-        );
-        kernels::linear_nobias(
-            v,
-            x_norm,
-            &layer.wv_weight_f32_prefill,
-            seq_len,
-            dim,
-            kv_dim,
-        );
+        let bf16 = decoder.weights_bf16;
+        prefill_linear(bf16, q, x_norm, &layer.wq_weight_f32_prefill, layer.wq_weight_bf16, seq_len, dim, q_dim);
+        prefill_linear(bf16, k, x_norm, &layer.wk_weight_f32_prefill, layer.wk_weight_bf16, seq_len, dim, kv_dim);
+        prefill_linear(bf16, v, x_norm, &layer.wv_weight_f32_prefill, layer.wv_weight_bf16, seq_len, dim, kv_dim);
 
         kernels::rms_norm_per_head(q, &layer.q_norm_weight, seq_len, n_heads, head_dim, eps);
         kernels::rms_norm_per_head(k, &layer.k_norm_weight, seq_len, n_kv_heads, head_dim, eps);
@@ -634,14 +634,7 @@ pub fn decoder_prefill(
         );
 
         let proj_out = &mut bufs.pref_proj_out[..seq_len * dim];
-        kernels::linear_nobias(
-            proj_out,
-            attn_out,
-            &layer.wo_weight_f32_prefill,
-            seq_len,
-            q_dim,
-            dim,
-        );
+        prefill_linear(bf16, proj_out, attn_out, &layer.wo_weight_f32_prefill, layer.wo_weight_bf16, seq_len, q_dim, dim);
         kernels::add_inplace(&mut bufs.pref_x[..seq_len * dim], proj_out, seq_len * dim);
 
         // Post-attention RMSNorm + SwiGLU MLP
@@ -656,27 +649,15 @@ pub fn decoder_prefill(
         );
 
         let gate_up = &mut bufs.pref_gate_up[..seq_len * 2 * intermediate];
-        kernels::linear_nobias(
-            gate_up,
-            x_norm2,
-            &layer.gate_up_fused_f32_prefill,
-            seq_len,
-            dim,
-            2 * intermediate,
-        );
+        prefill_linear(bf16, gate_up, x_norm2, &layer.gate_up_fused_f32_prefill,
+                       layer.gate_up_fused_bf16.as_ptr(), seq_len, dim, 2 * intermediate);
 
         let gate = &mut bufs.pref_gate[..seq_len * intermediate];
         kernels::swiglu_multiply(gate, gate_up, seq_len, intermediate);
 
         let ffn_out = &mut bufs.pref_ffn_out[..seq_len * dim];
-        kernels::linear_nobias(
-            ffn_out,
-            gate,
-            &layer.down_weight_f32_prefill,
-            seq_len,
-            intermediate,
-            dim,
-        );
+        prefill_linear(bf16, ffn_out, gate, &layer.down_weight_f32_prefill,
+                       layer.down_weight_bf16, seq_len, intermediate, dim);
         kernels::add_inplace(&mut bufs.pref_x[..seq_len * dim], ffn_out, seq_len * dim);
     }
 

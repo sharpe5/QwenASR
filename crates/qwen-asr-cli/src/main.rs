@@ -296,6 +296,7 @@ fn usage(prog: &str) {
     eprintln!("\nOptions:");
     opt("-t <n>", "Number of threads (default: all CPUs, capped at 10)");
     opt("-S <secs>", "Segment target seconds (default: 30; 0 = full-audio decode). Audio is split into ~30s segments because decoding longer spans makes the model loop and repeat itself; keep this near 30 unless you know what you're doing.");
+    opt("--weights <f32|bf16>", "Weight residency (default: f32). 'bf16' keeps projection weights BF16-resident (widened per matmul) instead of f32 copies — roughly halves weight RAM, identical math, slightly slower per process.");
     opt("-W <secs>", "Segment-cutting silence search window ± seconds (default: 3.0)");
     opt("--stream", "Streaming mode: process in chunks with prefix rollback (default: off)");
     opt("--stream-max-new-tokens <n>", "Max generated tokens per stream step (default: 32)");
@@ -386,6 +387,7 @@ fn main() {
     let mut srt_requested = false;
     let mut json_output = false;
     let mut clip_timestamps: Option<String> = None;
+    let mut weights_bf16 = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -409,6 +411,10 @@ fn main() {
             "-W" => {
                 i += 1;
                 search_sec = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(-1.0);
+            }
+            "--weights" => {
+                i += 1;
+                weights_bf16 = matches!(args.get(i).map(|s| s.as_str()), Some("bf16"));
             }
             "--stream" => {
                 stream_mode = true;
@@ -654,7 +660,7 @@ fn main() {
     }
 
     // Load model
-    let mut ctx = match QwenCtx::load(&model_dir) {
+    let mut ctx = match QwenCtx::load_opts(&model_dir, weights_bf16) {
         Some(c) => c,
         None => {
             eprintln!("Failed to load model from {}", model_dir);

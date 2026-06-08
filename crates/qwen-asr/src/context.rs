@@ -84,6 +84,15 @@ impl QwenCtx {
     /// let ctx = QwenCtx::load("qwen3-asr-0.6b").expect("failed to load");
     /// ```
     pub fn load(model_dir: &str) -> Option<Self> {
+        Self::load_opts(model_dir, false)
+    }
+
+    /// Like [`load`], but `weights_bf16` keeps the big projection weights BF16-resident
+    /// (raw mmap pointers, widened to f32 per matmul) instead of dequantizing them to
+    /// f32 Vecs at load. Roughly halves weight RAM; math is identical. See `--weights`.
+    ///
+    /// [`load`]: QwenCtx::load
+    pub fn load_opts(model_dir: &str, weights_bf16: bool) -> Option<Self> {
         if kernels::verbose() >= 1 {
             eprintln!("Loading model from {}", model_dir);
         }
@@ -115,13 +124,13 @@ impl QwenCtx {
         if kernels::verbose() >= 1 {
             eprintln!("Loading encoder weights...");
         }
-        let encoder = Encoder::load(&ms, &cfg)?;
+        let encoder = Encoder::load(&ms, &cfg, weights_bf16)?;
 
         // Load decoder
         if kernels::verbose() >= 1 {
             eprintln!("Loading decoder weights...");
         }
-        let decoder = Decoder::load(&ms, &cfg)?;
+        let decoder = Decoder::load(&ms, &cfg, weights_bf16)?;
 
         let kv_cache = KvCache::new(cfg.dec_layers, 2048, cfg.dec_kv_heads, cfg.dec_head_dim);
         let dec_bufs = DecoderBuffers::new(&cfg);

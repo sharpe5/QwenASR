@@ -687,6 +687,15 @@ pub fn linear_bf16(y: &mut [f32], x: &[f32], w_bf16: *const u16, b: Option<&[f32
     linear(y, x, &w_f32, b, seq_len, in_dim, out_dim);
 }
 
+/// BF16-resident analogue of [`linear_accumulate`]: `y += bias + x @ w.T`, widening the
+/// BF16 weight to f32 on the fly. Used by the encoder's residual-fused projections when
+/// weights are kept BF16-resident. The widen is a transient one-matrix buffer (freed on
+/// return), so resident weight RAM stays ~halved at the cost of a per-call conversion.
+pub fn linear_accumulate_bf16(y: &mut [f32], x: &[f32], w_bf16: *const u16, b: Option<&[f32]>, seq_len: usize, in_dim: usize, out_dim: usize) {
+    let w_f32 = bf16_to_f32_view(w_bf16, out_dim * in_dim);
+    linear_accumulate(y, x, &w_f32, b, seq_len, in_dim, out_dim);
+}
+
 /// Fused Q/K/V matvec for single-token decode
 #[allow(clippy::too_many_arguments)]
 pub fn linear_nobias_bf16_qkv(
