@@ -1,4 +1,5 @@
 mod download;
+mod opus_decode;
 #[cfg(target_os = "macos")]
 mod live_capture;
 
@@ -13,12 +14,23 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "mov", "avi", "webm", "m4v", "flv", "ts", "mpg", "mpeg", "wmv",
 ];
 
-fn is_video_file(path: &str) -> bool {
+/// Ogg/Opus container extensions decoded natively (libopus), bypassing ffmpeg.
+const OPUS_EXTENSIONS: &[&str] = &["opus", "ogg"];
+
+fn has_extension(path: &str, exts: &[&str]) -> bool {
     std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| VIDEO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .map(|e| exts.contains(&e.to_lowercase().as_str()))
         .unwrap_or(false)
+}
+
+fn is_video_file(path: &str) -> bool {
+    has_extension(path, VIDEO_EXTENSIONS)
+}
+
+fn is_opus_file(path: &str) -> bool {
+    has_extension(path, OPUS_EXTENSIONS)
 }
 
 /// Resolve a model-directory argument to an existing path.
@@ -90,9 +102,11 @@ fn extract_audio_from_video(path: &str) -> Option<Vec<f32>> {
     Some(samples)
 }
 
-/// Load audio from either a video (via ffmpeg) or a WAV file.
+/// Load audio from an Ogg/Opus file (native libopus), a video (via ffmpeg), or a WAV file.
 fn load_audio(path: &str) -> Option<Vec<f32>> {
-    if is_video_file(path) {
+    if is_opus_file(path) {
+        opus_decode::load_opus(path)
+    } else if is_video_file(path) {
         extract_audio_from_video(path)
     } else {
         audio::load_wav(path)
@@ -285,7 +299,7 @@ fn usage(prog: &str) {
     eprintln!("Usage: {} -d <model_dir> (-i <input> | --stdin | --live) [options]\n", prog);
     eprintln!("Required:");
     opt("-d <dir>", "Model directory (with *.safetensors, vocab.json)");
-    opt("-i <file>", "Input file: WAV (16-bit PCM) or video (mp4/mkv/mov/…, requires ffmpeg)");
+    opt("-i <file>", "Input file: WAV (16-bit PCM), Opus (.opus/.ogg, decoded natively), or video (mp4/mkv/mov/…, requires ffmpeg)");
     opt("--stdin", "Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)");
     opt("--language <lang>", "Output language (REQUIRED). See note and language list below.");
     eprintln!("\nLive capture (macOS only):");
@@ -725,7 +739,7 @@ fn main() {
         let samples = if use_stdin {
             audio::read_pcm_stdin()
         } else {
-            audio::load_wav(input_wav.as_ref().unwrap())
+            load_audio(input_wav.as_ref().unwrap())
         };
         let samples = match samples {
             Some(s) => s,
@@ -914,7 +928,7 @@ fn main() {
         transcribe::transcribe_stdin(&mut ctx)
     } else {
         let input = input_wav.as_ref().unwrap();
-        if is_video_file(input) {
+        if is_video_file(input) || is_opus_file(input) {
             match load_audio(input) {
                 Some(s) => transcribe::transcribe_audio(&mut ctx, &s),
                 None => None,
@@ -1439,6 +1453,19 @@ fn run_live_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opus_extensions_route_to_native_loader() {
+        // .opus/.ogg (any case) must take the native libopus path, NOT be mistaken
+        // for a video (ffmpeg) or fall through to the WAV parser.
+        for p in ["clip.opus", "CLIP.OPUS", "a/b/c.ogg", "x.Opus"] {
+            assert!(is_opus_file(p), "{p} should be opus");
+            assert!(!is_video_file(p), "{p} must not be treated as video");
+        }
+        for p in ["clip.wav", "clip.mp4", "clip.mkv", "noext"] {
+            assert!(!is_opus_file(p), "{p} should not be opus");
+        }
+    }
 
     #[test]
     fn parse_json_tolerates_whitespace() {
