@@ -105,7 +105,19 @@ fn extract_audio_from_video(path: &str) -> Option<Vec<f32>> {
 /// Load audio from an Ogg/Opus file (native libopus), a video (via ffmpeg), or a WAV file.
 fn load_audio(path: &str) -> Option<Vec<f32>> {
     if is_opus_file(path) {
-        opus_decode::load_opus(path)
+        match opus_decode::load_opus(path) {
+            Ok(pcm) => Some(pcm),
+            // A .ogg can instead carry Vorbis/FLAC, which libopus can't decode — hand
+            // those to ffmpeg rather than failing outright.
+            Err(opus_decode::OpusError::NotOpus) => {
+                eprintln!("Note: {path} is Ogg but not Opus; falling back to ffmpeg.");
+                extract_audio_from_video(path)
+            }
+            Err(e) => {
+                eprintln!("Error: failed to decode Opus {path}: {e}");
+                None
+            }
+        }
     } else if is_video_file(path) {
         extract_audio_from_video(path)
     } else {
@@ -927,14 +939,11 @@ fn main() {
     } else if use_stdin {
         transcribe::transcribe_stdin(&mut ctx)
     } else {
-        let input = input_wav.as_ref().unwrap();
-        if is_video_file(input) || is_opus_file(input) {
-            match load_audio(input) {
-                Some(s) => transcribe::transcribe_audio(&mut ctx, &s),
-                None => None,
-            }
-        } else {
-            transcribe::transcribe(&mut ctx, input)
+        // load_audio routes opus/video/wav internally (same as the align branch above),
+        // so there's one load path for every input — no per-format special-casing here.
+        match load_audio(input_wav.as_ref().unwrap()) {
+            Some(s) => transcribe::transcribe_audio(&mut ctx, &s),
+            None => None,
         }
     };
 
