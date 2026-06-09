@@ -210,7 +210,11 @@ pub fn forced_align(
     text: &str,
     language: &str,
 ) -> Option<Vec<AlignResult>> {
-    let cfg = &ctx.config.clone();
+    let mut cfg_owned = ctx.model.config.clone();
+    if let Some(w) = ctx.enc_n_window_infer_override {
+        cfg_owned.enc_n_window_infer = w;
+    }
+    let cfg = &cfg_owned;
     let dim = cfg.dec_hidden;
     let seg_time = cfg.timestamp_segment_time;
 
@@ -219,8 +223,10 @@ pub fn forced_align(
         return None;
     }
 
-    let vocab_path = format!("{}/vocab.json", ctx.model_dir);
-    let tokenizer = QwenTokenizer::load(&vocab_path)?;
+    // Tokenizer is resident in the shared model; borrow via a separate Arc handle
+    // so the borrow doesn't tie up `ctx` across the &mut decode calls below.
+    let model = ctx.model.clone();
+    let tokenizer = &model.tokenizer;
 
     ctx.reset_perf();
     ctx.perf_audio_ms = 1000.0 * samples.len() as f64 / SAMPLE_RATE as f64;
@@ -228,7 +234,7 @@ pub fn forced_align(
     let seg_t0 = get_time_ms();
 
     // Step 1: Tokenize text with timestamp interleaving
-    let (words, text_tokens) = encode_timestamp(text, language, &tokenizer)?;
+    let (words, text_tokens) = encode_timestamp(text, language, tokenizer)?;
 
     if kernels::verbose() >= 2 {
         eprintln!("  Align: {} words, {} text tokens", words.len(), text_tokens.len());
@@ -240,7 +246,7 @@ pub fn forced_align(
     let mel_ms = elapsed_ms(t0);
 
     let t0 = get_time_ms();
-    let (enc_output, enc_seq_len) = ctx.encoder.forward(cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
+    let (enc_output, enc_seq_len) = ctx.model.encoder.forward(cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
     let enc_ms = elapsed_ms(t0);
 
     if kernels::verbose() >= 2 {
@@ -256,7 +262,7 @@ pub fn forced_align(
     let total_seq = prefix_len + enc_seq_len + suffix_len + text_tokens.len();
 
     let mut input_embeds = vec![0.0f32; total_seq * dim];
-    let tok_emb = ctx.decoder.tok_embeddings_bf16;
+    let tok_emb = ctx.model.decoder.tok_embeddings_bf16;
 
     let mut off = 0;
     for &tok in PREFIX_HEAD {
@@ -297,7 +303,7 @@ pub fn forced_align(
     ctx.kv_cache.len = 0;
 
     let logits = decoder::decoder_prefill_logits(
-        &ctx.decoder, cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
+        &ctx.model.decoder, cfg, &mut ctx.kv_cache, &mut ctx.rope_cache,
         &mut ctx.dec_bufs, &input_embeds, total_seq,
     );
     let prefill_ms = elapsed_ms(t0);

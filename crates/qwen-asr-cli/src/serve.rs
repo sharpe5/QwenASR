@@ -14,13 +14,21 @@
 //! ONE physical copy of the weights regardless of N. Per-ctx anonymous RAM is just
 //! the decode scratch / KV — small next to the weights.
 //!
-//! Wire protocol (identical framing to tools/fluidaudio-serve; see
-//! mrecord util/coproc_fa_worker.py). Audio by PATH, params by value:
-//!   4-byte big-endian length prefix + JSON body, both directions.
-//!   server → {"ready": true}                                   once per connection
-//!   client → {"audio": "<path>", "regions": [[s,e],…], "language": "<lang>"}
-//!   server → {"text": "...", "segments": [{"start","end","text"}]}   (format_json)
-//!          | {"error": "..."}
+//! Wire protocol — a COMMAND/RESPONSE protocol, identical across both engines
+//! (qwen-asr and tools/fluidaudio-serve; see mrecord util/coproc_qwen_worker.py).
+//! 4-byte big-endian length prefix + JSON body, both directions. Audio by PATH.
+//!   server → {"ready":true,"engine":"qwen","model":"<dir>","version":"<v>"}  per connection
+//!   client → {"command":"<cmd>", …}                       (command is REQUIRED — no legacy fallback)
+//! Commands (the metadata ones are engine-agnostic and answered identically by
+//! fluidaudio-serve; only the response CONTENT differs):
+//!   {"command":"ping"}        → {"pong":true}
+//!   {"command":"version"}     → {"engine":"qwen","model":"<dir>","version":"<v>"}
+//!   {"command":"languages"}   → {"languages":[…]}
+//!   {"command":"transcribe","audio":"<path>","regions":[[s,e],…],"language":"<lang>"}
+//!                             → {"text":"…","segments":[{"start","end","text"}]}   (format_json)
+//! Any reply may instead be {"error":"…"} (transcribe adds "unsupported_language" when
+//! the model can't do the requested language). fluidaudio-serve's `transcribe` reply is
+//! a SUPERSET — it adds a `wordTimings` field — but is otherwise the same interface.
 //! stdout/stderr carry status noise and are NOT part of the protocol (the client
 //! routes them to a log file).
 
@@ -30,18 +38,56 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use serde::Deserialize;
 
-use qwen_asr::context::QwenCtx;
+use qwen_asr::config::SUPPORTED_LANGUAGES;
+use qwen_asr::context::{QwenCtx, QwenModel};
 use qwen_asr::{kernels, transcribe};
 
 use crate::{format_json, load_audio};
 
+/// This server's engine family, advertised in the READY/`info` metadata. The
+/// concrete model (e.g. `qwen3-asr-0.6b`) is reported separately; fluidaudio-serve
+/// advertises `"fluidaudio"` here. Same wire interface for both (see module docs).
+const ENGINE: &str = "qwen";
+
+/// A request envelope. `command` selects the operation — there is NO default, so a
+/// client must speak the command/response protocol (the legacy bare-`{audio}` form
+/// is intentionally rejected). `transcribe` reads `audio`/`regions`/`language`; the
+/// metadata commands (`ping`/`version`/`languages`) ignore them.
 #[derive(Deserialize)]
 struct Request {
+    command: String,
+    #[serde(default)]
     audio: String,
     #[serde(default)]
     regions: Vec<(f64, f64)>,
     #[serde(default)]
     language: String,
+}
+
+/// Server self-description, built ONCE at startup and shared (read-only) across all
+/// connection threads. Sent unsolicited in the READY frame and returned by the
+/// `version` command, so a client can confirm engine/model/version before driving it.
+struct ServeMeta {
+    ready: String,      // {"ready":true,"engine":..,"model":..,"version":..}
+    info: String,       // {"engine":..,"model":..,"version":..}   (the `version` reply)
+    languages: String,  // {"languages":[..]}
+}
+
+impl ServeMeta {
+    fn new(model: &str) -> Self {
+        let version = env!("CARGO_PKG_VERSION");
+        ServeMeta {
+            ready: serde_json::json!({
+                "ready": true, "engine": ENGINE, "model": model, "version": version,
+            })
+            .to_string(),
+            info: serde_json::json!({
+                "engine": ENGINE, "model": model, "version": version,
+            })
+            .to_string(),
+            languages: serde_json::json!({ "languages": SUPPORTED_LANGUAGES }).to_string(),
+        }
+    }
 }
 
 /// A stack of resident contexts handed out one-per-connection. `take` blocks on
@@ -76,17 +122,29 @@ pub fn run(sock: &str, model_dir: &str, weights_bf16: bool, workers: usize) {
     kernels::set_threads(1);
 
     let n = workers.max(1);
-    let mut ctxs = Vec::with_capacity(n);
-    for k in 0..n {
-        match QwenCtx::load_opts(model_dir, weights_bf16) {
-            Some(c) => ctxs.push(c),
-            None => {
-                eprintln!("serve: failed to load model from {} (worker {})", model_dir, k);
-                std::process::exit(1);
-            }
+    // Load the weights ONCE and share them across all N contexts. Each context
+    // is just an Arc bump + its own KV/scratch, so RAM no longer scales with N
+    // for the (identical, read-only) weights — the whole point of serve mode.
+    let model = match QwenModel::load_opts(model_dir, weights_bf16) {
+        Some(m) => m,
+        None => {
+            eprintln!("serve: failed to load model from {}", model_dir);
+            std::process::exit(1);
         }
+    };
+    let mut ctxs = Vec::with_capacity(n);
+    for _ in 0..n {
+        ctxs.push(QwenCtx::from_model(model.clone()));
     }
     let pool = Arc::new(CtxPool { free: Mutex::new(ctxs), cv: Condvar::new() });
+
+    // The model name advertised to clients: the model_dir's final component
+    // (e.g. "qwen3-asr-0.6b"), falling back to the whole path if it has none.
+    let model_name = std::path::Path::new(model_dir)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(model_dir);
+    let meta = Arc::new(ServeMeta::new(model_name));
 
     // Bind only AFTER the models load, so the client's "connect succeeds ⇒ ready"
     // assumption holds. Clear any stale socket from a previous run first.
@@ -98,13 +156,15 @@ pub fn run(sock: &str, model_dir: &str, weights_bf16: bool, workers: usize) {
             std::process::exit(1);
         }
     };
-    eprintln!("serve: ready on {} ({} worker(s), threads=1, bf16={})", sock, n, weights_bf16);
+    eprintln!("serve: ready on {} (engine={} model={} v{}, {} worker(s), threads=1, bf16={})",
+              sock, ENGINE, model_name, env!("CARGO_PKG_VERSION"), n, weights_bf16);
 
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 let pool = pool.clone();
-                std::thread::spawn(move || handle_conn(stream, &pool));
+                let meta = meta.clone();
+                std::thread::spawn(move || handle_conn(stream, &pool, &meta));
             }
             Err(e) => eprintln!("serve: accept error: {}", e),
         }
@@ -130,16 +190,16 @@ impl Drop for CtxGuard<'_> {
 
 /// Own one ctx for the connection's lifetime (via a guard so a panic can't leak it),
 /// send the READY frame, then loop request→reply until the peer closes.
-fn handle_conn(mut stream: UnixStream, pool: &CtxPool) {
+fn handle_conn(mut stream: UnixStream, pool: &CtxPool, meta: &ServeMeta) {
     let mut guard = CtxGuard { pool, ctx: Some(pool.take()) };
-    if send_frame(&mut stream, br#"{"ready":true}"#).is_err() {
+    if send_frame(&mut stream, meta.ready.as_bytes()).is_err() {
         return;  // guard returns the ctx on drop
     }
     loop {
         match recv_frame(&mut stream) {
             Ok(Some(body)) => {
                 let ctx = guard.ctx.as_mut().expect("ctx checked out for this connection");
-                let reply = handle_request(ctx, &body);
+                let reply = handle_request(ctx, &body, meta);
                 if send_frame(&mut stream, reply.as_bytes()).is_err() {
                     break;
                 }
@@ -151,13 +211,24 @@ fn handle_conn(mut stream: UnixStream, pool: &CtxPool) {
     // guard returns the ctx on drop (loop exit or unwind)
 }
 
-/// Decode one request body into a reply body (the JSON the client reads). Errors
-/// become `{"error": ...}` frames rather than dropping the connection.
-fn handle_request(ctx: &mut QwenCtx, body: &[u8]) -> String {
+/// Decode one request body into a reply body (the JSON the client reads). Dispatches
+/// on `command`; metadata commands answer from `meta`, `transcribe` runs the model.
+/// Errors become `{"error": ...}` frames rather than dropping the connection.
+fn handle_request(ctx: &mut QwenCtx, body: &[u8], meta: &ServeMeta) -> String {
     let req: Request = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => return error_json(&format!("bad request: {}", e)),
     };
+    // Command/response dispatch. The metadata commands are engine-agnostic and shared
+    // verbatim with fluidaudio-serve; only `transcribe` touches the model.
+    match req.command.as_str() {
+        "ping" => return r#"{"pong":true}"#.to_string(),
+        "version" => return meta.info.clone(),
+        "languages" => return meta.languages.clone(),
+        "transcribe" => {}  // fall through to the decode path below
+        "" => return error_json("missing 'command' field"),
+        other => return error_json(&format!("unknown command: {}", other)),
+    }
     // Language is per-request (the lane routes zh/ar/tr/… to one resident model),
     // so re-arm the prompt for this request's language before decoding. A language
     // this model can't do is flagged structurally (`unsupported_language`) so the lane

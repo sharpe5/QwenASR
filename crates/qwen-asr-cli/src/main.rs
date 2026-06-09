@@ -729,7 +729,7 @@ fn main() {
     }
     if enc_window_sec >= 0.0 {
         let window_frames = (enc_window_sec * 100.0 + 0.5) as usize;
-        ctx.config.enc_n_window_infer = window_frames.clamp(100, 800);
+        ctx.enc_n_window_infer_override = Some(window_frames.clamp(100, 800));
     }
     if stream_max_new_tokens > 0 {
         ctx.stream_max_new_tokens = stream_max_new_tokens;
