@@ -2,6 +2,8 @@ mod download;
 mod opus_decode;
 #[cfg(target_os = "macos")]
 mod live_capture;
+#[cfg(unix)]
+mod serve;
 
 use qwen_asr::{audio, config, context, kernels, transcribe, align};
 use config::*;
@@ -103,7 +105,7 @@ fn extract_audio_from_video(path: &str) -> Option<Vec<f32>> {
 }
 
 /// Load audio from an Ogg/Opus file (native libopus), a video (via ffmpeg), or a WAV file.
-fn load_audio(path: &str) -> Option<Vec<f32>> {
+pub(crate) fn load_audio(path: &str) -> Option<Vec<f32>> {
     if is_opus_file(path) {
         match opus_decode::load_opus(path) {
             Ok(pcm) => Some(pcm),
@@ -269,7 +271,7 @@ fn json_escape(s: &str) -> String {
 /// Build a Parakeet-compatible JSON transcript:
 /// `{"text":..,"segments":[{"start":S,"end":E,"text":".."}]}`.
 /// `start`/`end` are per-segment timestamps in seconds (3 decimal places).
-fn format_json(segments: &[transcribe::TranscriptSegment]) -> String {
+pub(crate) fn format_json(segments: &[transcribe::TranscriptSegment]) -> String {
     let mut full = String::new();
     let mut segs = String::new();
     for seg in segments {
@@ -343,6 +345,9 @@ fn usage(prog: &str) {
     opt("--profile", "Print per-operation timing breakdown (default: off)");
     opt("--debug", "Debug output (per-layer details) (default: off)");
     opt("--silent", "No status output (only transcription on stdout) (default: off)");
+    eprintln!("\nServer mode (resident, load-once):");
+    opt("--serve <sock>", "Load the model once and answer many transcription requests over an AF_UNIX socket at <sock> (4-byte big-endian length prefix + JSON; request {\"audio\":<path>,\"regions\":[[s,e],…],\"language\":<lang>}, reply {\"text\":..,\"segments\":[…]}). Forces single-threaded matmul; concurrency comes from --workers. Ignores -i/--language/--clip-timestamps (those travel per request).");
+    opt("--workers <n>", "Concurrent decoders in --serve mode (default: 1). Each is one QwenCtx + connection decoding single-threaded; all share the mmap'd weights (one physical copy). Open <n> client connections to drive them in parallel.");
     eprintln!("\nModel management:");
     eprintln!("  {} download [--list] [<model>] [--output <dir>]", prog);
     opt("-h", "Show this help");
@@ -414,6 +419,11 @@ fn main() {
     let mut json_output = false;
     let mut clip_timestamps: Option<String> = None;
     let mut weights_bf16 = false;
+    // Resident `--serve <sock>` mode: load once, answer many requests over an
+    // AF_UNIX socket (see serve.rs). `--workers N` = concurrent decoders (one
+    // QwenCtx + connection each, all sharing the mmap'd weights).
+    let mut serve_sock: Option<String> = None;
+    let mut serve_workers: usize = 1;
 
     let mut i = 1;
     while i < args.len() {
@@ -508,6 +518,14 @@ fn main() {
                 i += 1;
                 clip_timestamps = args.get(i).cloned();
             }
+            "--serve" => {
+                i += 1;
+                serve_sock = args.get(i).cloned();
+            }
+            "--workers" => {
+                i += 1;
+                serve_workers = args.get(i).and_then(|s| s.parse().ok()).filter(|&n| n >= 1).unwrap_or(1);
+            }
             "--stdin" => {
                 use_stdin = true;
             }
@@ -576,6 +594,14 @@ fn main() {
             download::list_models();
             std::process::exit(1);
         }
+    }
+
+    // Resident serve mode: load the model (×`--workers`) once and answer many
+    // requests over the AF_UNIX socket. Language/input/clip flags don't apply —
+    // they travel per-request — so dispatch here, before the one-shot validation.
+    if let Some(sock) = serve_sock {
+        serve::run(&sock, &model_dir, weights_bf16, serve_workers);
+        return; // serve::run loops until the socket closes
     }
 
     if input_wav.is_none() && !use_stdin && !live_mode {

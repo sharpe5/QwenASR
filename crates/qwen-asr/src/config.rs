@@ -164,11 +164,59 @@ pub const SUPPORTED_LANGUAGES: &[&str] = &[
     "Persian", "Greek", "Romanian", "Hungarian", "Macedonian",
 ];
 
+/// ISO 639 code → the English language NAME used in [`SUPPORTED_LANGUAGES`].
+/// Mostly 639-1 (two-letter); a few entries use 639-2/3 where 639-1 has no code
+/// (Cantonese `yue`, Filipino `fil`/`tl`). Input is already lowercased.
+fn iso_639_to_language(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "zh" => "Chinese",
+        "en" => "English",
+        "yue" => "Cantonese",
+        "ar" => "Arabic",
+        "de" => "German",
+        "fr" => "French",
+        "es" => "Spanish",
+        "pt" => "Portuguese",
+        "id" => "Indonesian",
+        "it" => "Italian",
+        "ko" => "Korean",
+        "ru" => "Russian",
+        "th" => "Thai",
+        "vi" => "Vietnamese",
+        "ja" => "Japanese",
+        "tr" => "Turkish",
+        "hi" => "Hindi",
+        "ms" => "Malay",
+        "nl" => "Dutch",
+        "sv" => "Swedish",
+        "da" => "Danish",
+        "fi" => "Finnish",
+        "pl" => "Polish",
+        "cs" => "Czech",
+        "fil" | "tl" => "Filipino",
+        "fa" => "Persian",
+        "el" => "Greek",
+        "ro" => "Romanian",
+        "hu" => "Hungarian",
+        "mk" => "Macedonian",
+        _ => return None,
+    })
+}
+
+/// Resolve a language argument to a canonical [`SUPPORTED_LANGUAGES`] name, or
+/// `None` if unknown. Accepts both the English name (case-insensitive, e.g.
+/// `"arabic"`/`"Arabic"`) and an ISO 639 code (`"ar"`), so the same value works
+/// whether a caller speaks codes (the coproc lane routes by ISO) or names.
 pub fn normalize_language(language: &str) -> Option<String> {
     let trimmed = language.trim();
     if trimmed.is_empty() {
         return None;
     }
+    // ISO 639 code first (codes never collide with the full English names).
+    if let Some(name) = iso_639_to_language(&trimmed.to_lowercase()) {
+        return Some(name.to_string());
+    }
+    // Otherwise treat it as an English name: capitalize the first letter.
     let mut chars = trimmed.chars();
     let first = chars.next()?.to_uppercase().to_string();
     let rest: String = chars.map(|c| c.to_lowercase().next().unwrap_or(c)).collect();
@@ -178,5 +226,43 @@ pub fn normalize_language(language: &str) -> Option<String> {
         Some(normalized)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod normalize_language_tests {
+    use super::*;
+
+    #[test]
+    fn iso_codes_resolve_to_names() {
+        assert_eq!(normalize_language("ar").as_deref(), Some("Arabic"));
+        assert_eq!(normalize_language("en").as_deref(), Some("English"));
+        assert_eq!(normalize_language("ZH").as_deref(), Some("Chinese")); // case-insensitive
+        assert_eq!(normalize_language("ja").as_deref(), Some("Japanese"));
+        assert_eq!(normalize_language("tl").as_deref(), Some("Filipino")); // alias
+    }
+
+    #[test]
+    fn names_still_resolve() {
+        assert_eq!(normalize_language("Arabic").as_deref(), Some("Arabic"));
+        assert_eq!(normalize_language("arabic").as_deref(), Some("Arabic"));
+        assert_eq!(normalize_language("  german ").as_deref(), Some("German"));
+    }
+
+    #[test]
+    fn unknown_is_none() {
+        assert_eq!(normalize_language("xx"), None);
+        assert_eq!(normalize_language("Klingon"), None);
+        assert_eq!(normalize_language(""), None);
+    }
+
+    #[test]
+    fn every_iso_maps_to_a_supported_name() {
+        for code in ["zh","en","yue","ar","de","fr","es","pt","id","it","ko","ru",
+                     "th","vi","ja","tr","hi","ms","nl","sv","da","fi","pl","cs",
+                     "fil","tl","fa","el","ro","hu","mk"] {
+            let name = normalize_language(code).expect(code);
+            assert!(SUPPORTED_LANGUAGES.contains(&name.as_str()), "{code} → {name}");
+        }
     }
 }
