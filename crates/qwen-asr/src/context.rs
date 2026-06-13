@@ -161,6 +161,14 @@ pub struct QwenCtx {
     /// Mel spectrogram + encoder forward pass time combined.
     pub perf_encode_ms: f64,
     pub perf_decode_ms: f64,
+    /// Observe-only decode-health counters (read by the serve logger; no behavior
+    /// change). `perf_segments` = segments decoded this request; `perf_maxed_segments`
+    /// = those that hit the autoregressive `max_tokens` cap WITHOUT emitting EOS — the
+    /// degeneracy signature behind multi-hour "stuck" decodes. A healthy segment stops
+    /// at EOS in ~50-200 tokens; a maxed one burns the full 2048, so a request where
+    /// every segment maxes out runs ~10-40x longer than a normal one.
+    pub perf_segments: i32,
+    pub perf_maxed_segments: i32,
 }
 
 impl QwenCtx {
@@ -220,6 +228,8 @@ impl QwenCtx {
             perf_audio_ms: 0.0,
             perf_encode_ms: 0.0,
             perf_decode_ms: 0.0,
+            perf_segments: 0,
+            perf_maxed_segments: 0,
         }
     }
 
@@ -299,5 +309,7 @@ impl QwenCtx {
         self.perf_audio_ms = 0.0;
         self.perf_encode_ms = 0.0;
         self.perf_decode_ms = 0.0;
+        self.perf_segments = 0;
+        self.perf_maxed_segments = 0;
     }
 }

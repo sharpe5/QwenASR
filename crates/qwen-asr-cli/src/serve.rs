@@ -240,10 +240,31 @@ fn handle_request(ctx: &mut QwenCtx, body: &[u8], meta: &ServeMeta) -> String {
         })
         .to_string();
     }
+    // Per-request observability (routed to qwen-serve.log by the client). The START
+    // line is emitted BEFORE the decode so an in-flight wedge is visible as a START with
+    // no matching DONE — the only way to catch a "stuck" decode while it is still stuck,
+    // since stderr is unbuffered and the request otherwise produces no output until it
+    // returns. The DONE line carries the wall time and the degeneracy counters that
+    // explain a slow one. See module docs: stdout/stderr is status noise, not protocol.
+    let n_regions = req.regions.len();
+    eprintln!(
+        "[qwen-serve] t={} START transcribe lang={} regions={} audio={}",
+        now_ms(), req.language, n_regions, req.audio
+    );
+    let wall = std::time::Instant::now();
     let samples = match load_audio(&req.audio) {
         Some(s) => s,
-        None => return error_json(&format!("could not load audio: {}", req.audio)),
+        None => {
+            eprintln!(
+                "[qwen-serve] t={} FAIL load_audio wall_ms={} audio={}",
+                now_ms(), wall.elapsed().as_millis(), req.audio
+            );
+            return error_json(&format!("could not load audio: {}", req.audio));
+        }
     };
+    // Input is always 16 kHz mono (the lane decodes opus to that before sending); used
+    // only to report ×realtime in the log, so a hardcoded rate is fine here.
+    let clip_ms = samples.len() as f64 * 1000.0 / 16_000.0;
     // Seconds-pairs → (start_ms, end_ms) on the original timeline; transcribe_clips
     // re-bases segment times back to it. No regions → whole-clip segmented decode.
     let regions: Vec<(u64, u64)> = req
@@ -256,10 +277,40 @@ fn handle_request(ctx: &mut QwenCtx, body: &[u8], meta: &ServeMeta) -> String {
     } else {
         transcribe::transcribe_clips(ctx, &samples, &regions)
     };
+    let wall_ms = wall.elapsed().as_millis();
     match segments {
-        Some(segs) => format_json(&segs),
-        None => error_json("transcription failed"),
+        Some(segs) => {
+            // ×realtime = audio seconds ÷ compute seconds; a maxed>0 request is the
+            // degenerate, multi-hour-per-block case (see transcribe_segment).
+            let xrt = if wall_ms > 0 { clip_ms / wall_ms as f64 } else { 0.0 };
+            eprintln!(
+                "[qwen-serve] t={} DONE transcribe lang={} wall_ms={} clip_ms={:.0} xrt={:.1} \
+                 segments={} maxed={} text_tokens={}{} audio={}",
+                now_ms(), req.language, wall_ms, clip_ms, xrt,
+                ctx.perf_segments, ctx.perf_maxed_segments, ctx.perf_text_tokens,
+                if ctx.perf_maxed_segments > 0 { " DEGENERATE" } else { "" },
+                req.audio,
+            );
+            format_json(&segs)
+        }
+        None => {
+            eprintln!(
+                "[qwen-serve] t={} FAIL transcribe lang={} wall_ms={} audio={}",
+                now_ms(), req.language, wall_ms, req.audio
+            );
+            error_json("transcription failed")
+        }
     }
+}
+
+/// Wall-clock epoch milliseconds for log line prefixes, so a serve log line can be
+/// correlated against the coproc job ledger's timestamps. Monotonic time is used for
+/// durations (`Instant`); this is only for the absolute `t=` stamp.
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 fn ms(seconds: f64) -> u64 {

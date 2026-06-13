@@ -358,6 +358,16 @@ fn transcribe_segment(
     ctx.perf_encode_ms += mel_ms + enc_ms;
     ctx.perf_decode_ms += prefill_ms + decode_ms;
 
+    // Observe-only degeneracy accounting (no behavior change). A segment that ran the
+    // full `max_tokens` budget without ever hitting EOS never broke out of the loop
+    // above — the model is repeating/degenerate. The offline path has no early-stop
+    // (unlike `transcribe_stream`), so each such segment costs ~10-40x a healthy one
+    // (~50-200 tokens); that is what turns a ~70-min block into a multi-hour "stuck" one.
+    ctx.perf_segments += 1;
+    if n_generated >= max_tokens {
+        ctx.perf_maxed_segments += 1;
+    }
+
     Some((trimmed, n_text_tokens))
 }
 
