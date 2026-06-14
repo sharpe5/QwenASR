@@ -18,9 +18,22 @@ const SUFFIX_BASE: &[i32] = &[151670, 151645, 198, 151644, 77091, 198];
 const STREAM_DEGEN_MAX_PERIOD: usize = 6;
 const STREAM_DEGEN_MIN_REPEATS: usize = 4;
 const STREAM_STALE_CHUNKS: i32 = 4;
+// C `dropped_repeat_tokens >= 8` (qwen_asr.c:1964): if the MAX_REPEAT_TOKEN_RUN guard trims
+// at least this many tokens in a chunk, force a stream re-anchor so the poisoned context can't
+// keep spamming the same token on the next chunk.
+const STREAM_DEGEN_DROP_RESET: usize = 8;
 const STREAM_RESET_INTERVAL_CHUNKS: i32 = 45;
 const STREAM_RESET_CARRY_TOKENS: usize = 24;
 const STREAM_MAX_ENC_WINDOWS: usize = 4;
+// Single-token-run suppression cap at the stream commit (antirez's QWEN_STREAM_MAX_REPEAT_TOKEN_RUN).
+const STREAM_MAX_REPEAT_TOKEN_RUN: i32 = 12;
+
+// Batch (segment) loop detector — see is_repetition_loop / docs/loop-detection.md. A WIDER
+// period than the stream path's tuned 6 so it catches sentence-length phrase loops; same 4-reps
+// threshold. Not runtime-tunable (the stream path proves these are fine as constants); the only
+// loop knob the segment path exposes is the on/off `--loop-detect` and the recovery bounds.
+const SEGMENT_DEGEN_MAX_PERIOD: usize = 32;
+const SEGMENT_DEGEN_MIN_REPEATS: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PrefillRowKey {
@@ -112,13 +125,54 @@ fn stream_tail_repeat_blocks(tokens: &[i32], max_period: usize) -> (usize, usize
     (best_reps, best_period)
 }
 
-/// Transcribe a single segment. Returns (text, n_text_tokens).
+/// Port of antirez's C `QWEN_STREAM_MAX_REPEAT_TOKEN_RUN` guard (the Rust port had dropped
+/// it). Drops tokens from `chunk` that extend a run of the SAME token beyond `max_run`,
+/// counting the run continued from the already-committed `prefix` tail — so single-token
+/// spam is suppressed at the stream commit. In-place; no-op when `max_run < 1`. Returns the
+/// number of tokens dropped — the caller forces a stream re-anchor when it reaches
+/// `STREAM_DEGEN_DROP_RESET` (C `dropped_repeat_tokens >= 8`, qwen_asr.c:1964).
+fn suppress_repeat_token_runs(prefix: &[i32], chunk: &mut Vec<i32>, max_run: i32) -> usize {
+    if max_run < 1 || chunk.is_empty() {
+        return 0;
+    }
+    let before = chunk.len();
+    let mut prev_tok = -1i32;
+    let mut prev_run = 0i32;
+    if let Some(&last) = prefix.last() {
+        prev_tok = last;
+        prev_run = 1;
+        for &t in prefix.iter().rev().skip(1) {
+            if t != prev_tok {
+                break;
+            }
+            prev_run += 1;
+            if prev_run >= max_run {
+                break;
+            }
+        }
+    }
+    chunk.retain(|&tok| {
+        if tok == prev_tok {
+            prev_run += 1;
+            prev_run <= max_run // drop once the run exceeds max_run
+        } else {
+            prev_tok = tok;
+            prev_run = 1;
+            true
+        }
+    });
+    before - chunk.len()
+}
+
+/// Transcribe a single segment. Returns (text, n_text_tokens, degenerate) where
+/// `degenerate` is true when loop detection (loop_detect) judged the output a repetition
+/// loop — maxed token budget without EOS, or a tail block repeated >= loop_min_repeats times.
 fn transcribe_segment(
     ctx: &mut QwenCtx,
     samples: &[f32],
     tokenizer: &QwenTokenizer,
     past_tokens: Option<&[i32]>,
-) -> Option<(String, i32)> {
+) -> Option<(String, i32, bool)> {
     let mut cfg_owned = ctx.model.config.clone();
     if let Some(w) = ctx.enc_n_window_infer_override {
         cfg_owned.enc_n_window_infer = w;
@@ -302,6 +356,8 @@ fn transcribe_segment(
     let mut past_asr_text = n_force_prompt_tokens > 0 || n_past > 0;
 
     let mut text_bytes: Vec<u8> = Vec::new();
+    // Text token ids, kept for loop/degeneracy detection (stream_tail_repeat_blocks).
+    let mut text_tokens: Vec<i32> = Vec::new();
     let mut tmp_embed = vec![0.0f32; dim];
 
     while n_generated < max_tokens {
@@ -316,6 +372,7 @@ fn transcribe_segment(
         } else if past_asr_text {
             let piece_bytes = tokenizer.decode_bytes(token);
             text_bytes.extend_from_slice(piece_bytes);
+            text_tokens.push(token);
             n_text_tokens += 1;
 
             if let Some(ref cb) = ctx.token_cb {
@@ -364,11 +421,32 @@ fn transcribe_segment(
     // (unlike `transcribe_stream`), so each such segment costs ~10-40x a healthy one
     // (~50-200 tokens); that is what turns a ~70-min block into a multi-hour "stuck" one.
     ctx.perf_segments += 1;
-    if n_generated >= max_tokens {
+    let maxed = n_generated >= max_tokens;
+    if maxed {
         ctx.perf_maxed_segments += 1;
     }
 
-    Some((trimmed, n_text_tokens))
+    // Loop/degeneracy detection (docs/loop-detection.md). A segment is degenerate if it ran to
+    // the token cap without EOS (maxed — the high-confidence observe-only signal), OR its tail is
+    // a repetition LOOP per is_repetition_loop (a block repeated >= loop_min_repeats times AND
+    // covering most of the output). The coverage gate is what keeps legitimate brief repetition
+    // (a refrain repeated a few times) from being mistaken for a runaway loop.
+    let degenerate = ctx.loop_detect
+        && (maxed
+            || is_repetition_loop(&text_tokens, SEGMENT_DEGEN_MAX_PERIOD, SEGMENT_DEGEN_MIN_REPEATS));
+
+    Some((trimmed, n_text_tokens, degenerate))
+}
+
+/// True if `tokens` ends in a repetition LOOP: a block of <= `max_period` tokens repeated
+/// >= `min_reps` times (via antirez's `stream_tail_repeat_blocks`) AND that repeat covering at
+/// least HALF of `tokens`. The coverage gate is the false-positive guard: a runaway loop
+/// dominates the output (the repeat is ~the whole tail), whereas legitimate brief repetition (a
+/// sung refrain, a chant, a repeated list item) is only a small fraction of the segment and is
+/// NOT flagged. See docs/loop-detection.md.
+fn is_repetition_loop(tokens: &[i32], max_period: usize, min_reps: usize) -> bool {
+    let (reps, period) = stream_tail_repeat_blocks(tokens, max_period);
+    reps >= min_reps && 2 * reps.saturating_mul(period) >= tokens.len()
 }
 
 // ========================================================================
@@ -400,6 +478,90 @@ fn find_split_point(samples: &[f32], target_sample: usize, search_sec: f32) -> u
     }
 
     best_center
+}
+
+/// Transcribe one segment's audio, recovering from decoder repetition loops WITHOUT
+/// recursion (docs/loop-detection.md). Decodes the span; if `transcribe_segment` reports it
+/// degenerate, the span is halved at a WORD BOUNDARY — `find_split_point` picks the lowest-
+/// energy point within ±`search_sec` of the midpoint, so the cut lands in a gap, not mid-word
+/// — and each half is re-decoded. Driven by an explicit work-stack (no call recursion),
+/// bounded by `loop_max_depth` halvings and the `loop_min_split_sec` size floor. Emitted
+/// sub-segments are sorted back into time order. With `loop_detect` off, nothing is ever
+/// flagged degenerate, so this decodes the span exactly once — identical to legacy behavior.
+fn transcribe_with_recovery(
+    ctx: &mut QwenCtx,
+    samples: &[f32],
+    tokenizer: &QwenTokenizer,
+    base_ms: u64,
+    out: &mut Vec<TranscriptSegment>,
+) {
+    let min_samples = SAMPLE_RATE as usize / 2;
+    let min_split = (ctx.loop_min_split_sec.max(0.0) * SAMPLE_RATE as f32) as usize;
+    let max_depth = ctx.loop_max_depth.max(0);
+
+    // Work-stack of (start, end, depth) offsets into `samples`. Pop → decode → either emit
+    // or push the two halves. LIFO with "push right then left" processes left-first; the
+    // final sort by start_ms makes ordering bulletproof regardless.
+    let mut work: Vec<(usize, usize, i32)> = vec![(0, samples.len(), 0)];
+    let mut done: Vec<TranscriptSegment> = Vec::new();
+
+    while let Some((s, e, depth)) = work.pop() {
+        let seg = &samples[s..e];
+        let seg_len = e - s;
+        // Record this sub-segment's audio duration for the xRT/perf log (NOT a token budget —
+        // max_tokens is a flat constant; this only feeds the realtime-ratio reporting).
+        ctx.perf_audio_ms = 1000.0 * seg_len as f64 / SAMPLE_RATE as f64;
+        // Pad sub-minimum slices to the model floor.
+        let seg_buf: Vec<f32>;
+        let seg_ptr = if seg_len < min_samples {
+            seg_buf = {
+                let mut buf = vec![0.0f32; min_samples];
+                buf[..seg_len].copy_from_slice(seg);
+                buf
+            };
+            &seg_buf[..]
+        } else {
+            seg
+        };
+
+        // Snapshot the observe-only counters so a DISCARDED (re-split) decode doesn't inflate
+        // them — only the FINAL emitted segments should count, so a clip that recovers cleanly
+        // never reads back as DEGENERATE and perf_segments stays == the emitted-segment count.
+        let segments_before = ctx.perf_segments;
+        let maxed_before = ctx.perf_maxed_segments;
+        let (text, _n, degenerate) = match transcribe_segment(ctx, seg_ptr, tokenizer, None) {
+            Some(r) => r,
+            None => continue,
+        };
+
+        // Recover: split at a WORD BOUNDARY (find_split_point = lowest-energy point within
+        // ±search of the midpoint) and re-decode each half — while depth allows AND the span is
+        // at least 2*min_split. NOTE: the floor gates WHETHER to split, not the exact half sizes:
+        // the cut follows the word gap, so halves can be uneven and one may fall below
+        // loop_min_split_sec. That's deliberate — a clean word-boundary cut matters more than
+        // hitting an exact size (forcing the size would push the cut mid-word). The undersized
+        // half is still a valid short clip; it just won't be split again (it's < 2*min_split).
+        if degenerate && depth < max_depth && seg_len >= 2 * min_split.max(1) {
+            // This decode is thrown away and replaced by the two halves — roll back its counters.
+            ctx.perf_segments = segments_before;
+            ctx.perf_maxed_segments = maxed_before;
+            let search = ctx.search_sec.min(seg_len as f32 / SAMPLE_RATE as f32 / 2.0);
+            let rel = find_split_point(seg, seg_len / 2, search).clamp(1, seg_len - 1);
+            let split = s + rel;
+            work.push((split, e, depth + 1));
+            work.push((s, split, depth + 1));
+            continue;
+        }
+
+        if !text.is_empty() {
+            let start_ms = base_ms + (s as u64 * 1000) / SAMPLE_RATE as u64;
+            let end_ms = base_ms + (e as u64 * 1000) / SAMPLE_RATE as u64;
+            done.push(TranscriptSegment { start_ms, end_ms, text });
+        }
+    }
+
+    done.sort_by_key(|t| t.start_ms);
+    out.extend(done);
 }
 
 fn should_insert_boundary_space(prev_ch: u8, next_ch: u8) -> bool {
@@ -454,29 +616,11 @@ fn segment_slice(
     let search_sec = ctx.search_sec.min(segment_sec / 2.0);
     let target_samples = (segment_sec * SAMPLE_RATE as f32) as usize;
     let margin_samples = (search_sec * SAMPLE_RATE as f32) as usize;
-    let min_samples = SAMPLE_RATE as usize / 2;
 
     if samples.len() <= target_samples + margin_samples {
-        let seg_end = samples.len();
-        let start_ms = base_ms;
-        let end_ms = base_ms + (seg_end as u64 * 1000) / SAMPLE_RATE as u64;
-        ctx.perf_audio_ms = 1000.0 * seg_end as f64 / SAMPLE_RATE as f64;
-        let seg_buf: Vec<f32>;
-        let seg_ptr = if seg_end < min_samples {
-            seg_buf = {
-                let mut buf = vec![0.0f32; min_samples];
-                buf[..seg_end].copy_from_slice(samples);
-                buf
-            };
-            &seg_buf[..]
-        } else {
-            samples
-        };
-        if let Some((text, _)) = transcribe_segment(ctx, seg_ptr, tokenizer, None) {
-            if !text.is_empty() {
-                out.push(TranscriptSegment { start_ms, end_ms, text });
-            }
-        }
+        // Whole slice fits in one segment — still run loop-recovery (it may halve a
+        // degenerate short file). perf_audio_ms / padding / emit live inside the helper.
+        transcribe_with_recovery(ctx, samples, tokenizer, base_ms, out);
         return;
     }
 
@@ -496,37 +640,11 @@ fn segment_slice(
     for s in 0..n_splits {
         let seg_start = splits[s];
         let seg_end = if s + 1 < n_splits { splits[s + 1] } else { samples.len() };
-        let seg_len = seg_end - seg_start;
-
-        let start_ms = base_ms + (seg_start as u64 * 1000) / SAMPLE_RATE as u64;
-        let end_ms = base_ms + (seg_end as u64 * 1000) / SAMPLE_RATE as u64;
-
-        // Set perf_audio_ms to this segment's duration so the token budget
-        // is per-segment, not the full file (avoids the 6-token fast-cap).
-        ctx.perf_audio_ms = 1000.0 * seg_len as f64 / SAMPLE_RATE as f64;
-
-        let seg_buf: Vec<f32>;
-        let seg_ptr = if seg_len < min_samples {
-            seg_buf = {
-                let mut buf = vec![0.0f32; min_samples];
-                buf[..seg_len].copy_from_slice(&samples[seg_start..seg_end]);
-                buf
-            };
-            &seg_buf[..]
-        } else {
-            &samples[seg_start..seg_end]
-        };
-
-        let (text, _) = match transcribe_segment(ctx, seg_ptr, tokenizer, None) {
-            Some(r) => r,
-            None => continue,
-        };
-
-        if text.is_empty() {
-            continue;
-        }
-
-        out.push(TranscriptSegment { start_ms, end_ms, text });
+        let seg_base_ms = base_ms + (seg_start as u64 * 1000) / SAMPLE_RATE as u64;
+        // Per coarse ~30s segment, run the loop-recovery transcriber: it decodes the
+        // segment and, if degenerate, halves it at word boundaries and re-decodes (no
+        // recursion — explicit work-stack). perf_audio_ms / padding / emit live inside it.
+        transcribe_with_recovery(ctx, &samples[seg_start..seg_end], tokenizer, seg_base_ms, out);
     }
 }
 
@@ -695,7 +813,7 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
     // No splitting if segment_sec is 0 or audio fits in one segment
     if ctx.segment_sec <= 0.0 || audio_samples.len() <= target_samples + margin_samples {
-        let (text, _) = transcribe_segment(ctx, &audio_samples, tokenizer, None)?;
+        let (text, _, _) = transcribe_segment(ctx, &audio_samples, tokenizer, None)?;
         return Some(text);
     }
 
@@ -760,7 +878,7 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             None
         };
 
-        let (seg_text, _seg_text_tokens) =
+        let (seg_text, _seg_text_tokens, _degenerate) =
             match transcribe_segment(ctx, seg_ptr, tokenizer, past_tokens.as_deref()) {
             Some(r) => r,
             None => continue,
@@ -850,7 +968,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         let model = ctx.model.clone();
         let tokenizer = &model.tokenizer;
         ctx.prepare_prompt_tokens(tokenizer);
-        let (text, _) = transcribe_segment(ctx, &audio_samples, tokenizer, None)?;
+        let (text, _, _) = transcribe_segment(ctx, &audio_samples, tokenizer, None)?;
         return Some(text);
     }
 
@@ -1150,6 +1268,11 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
         // Update raw token history
         raw_tokens.truncate(n_prefix_tokens);
+        let dropped_repeat_tokens = if ctx.loop_detect {
+            suppress_repeat_token_runs(&raw_tokens, &mut chunk_tokens, STREAM_MAX_REPEAT_TOKEN_RUN)
+        } else {
+            0
+        };
         raw_tokens.extend_from_slice(&chunk_tokens);
 
         // Streaming degeneracy detection
@@ -1160,7 +1283,9 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
             prev_tail_snapshot = raw_tokens.clone();
         }
         let (best_reps, _) = stream_tail_repeat_blocks(&raw_tokens, STREAM_DEGEN_MAX_PERIOD);
-        let is_degen = stale_count >= STREAM_STALE_CHUNKS || best_reps >= STREAM_DEGEN_MIN_REPEATS;
+        let is_degen = stale_count >= STREAM_STALE_CHUNKS
+            || best_reps >= STREAM_DEGEN_MIN_REPEATS
+            || dropped_repeat_tokens >= STREAM_DEGEN_DROP_RESET;
 
         if is_degen {
             if kernels::verbose() >= 2 {
@@ -1744,6 +1869,11 @@ pub fn stream_push_audio(
 
     // ---- Update raw token history ----
     state.raw_tokens.truncate(n_prefix_tokens);
+    let dropped_repeat_tokens = if ctx.loop_detect {
+        suppress_repeat_token_runs(&state.raw_tokens, &mut chunk_tokens, STREAM_MAX_REPEAT_TOKEN_RUN)
+    } else {
+        0
+    };
     state.raw_tokens.extend_from_slice(&chunk_tokens);
 
     // ---- Streaming degeneracy detection ----
@@ -1756,8 +1886,9 @@ pub fn stream_push_audio(
         }
             let (best_reps, _) =
                 stream_tail_repeat_blocks(&state.raw_tokens, STREAM_DEGEN_MAX_PERIOD);
-            let is_degen =
-                state.stale_count >= STREAM_STALE_CHUNKS || best_reps >= STREAM_DEGEN_MIN_REPEATS;
+            let is_degen = state.stale_count >= STREAM_STALE_CHUNKS
+                || best_reps >= STREAM_DEGEN_MIN_REPEATS
+                || dropped_repeat_tokens >= STREAM_DEGEN_DROP_RESET;
 
         if is_degen {
             if kernels::verbose() >= 2 {
@@ -1868,4 +1999,105 @@ pub fn stream_push_audio(
     } // end while loop
 
     Some(String::from_utf8_lossy(&delta_bytes).into_owned())
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+
+    // ── Detection: stream_tail_repeat_blocks (ported from antirez's C) ──
+    // Mirrors the real Arabic monster loop: a sentence-length PHRASE repeated many times.
+    // The phrase is > 6 tokens, so the stream path's tuned period-6 MISSES it while the
+    // batch detector's wider period CATCHES it — the exact gap this feature closes.
+    #[test]
+    fn detects_phrase_loop_at_wide_period_but_misses_at_six() {
+        let phrase: Vec<i32> = (100..109).collect(); // 9-token "phrase"
+        let mut toks = Vec::new();
+        for _ in 0..50 {
+            toks.extend_from_slice(&phrase);
+        }
+        assert!(
+            stream_tail_repeat_blocks(&toks, 32).0 >= 4,
+            "wide period (batch) must flag a 9-token phrase loop"
+        );
+        assert!(
+            stream_tail_repeat_blocks(&toks, 6).0 < 4,
+            "period-6 (stream) misses a >6-token phrase loop — why batch needs the wider period"
+        );
+    }
+
+    #[test]
+    fn clean_text_is_not_flagged() {
+        let toks: Vec<i32> = (0..300).collect(); // all distinct, no tail repetition
+        assert!(stream_tail_repeat_blocks(&toks, 32).0 < 4);
+    }
+
+    // Coverage guard: is_repetition_loop flags a runaway loop (the repeat dominates) but NOT a
+    // legitimate brief refrain (the same block repeated a few times within mostly-distinct text).
+    #[test]
+    fn repetition_loop_flags_dominant_loop_not_brief_refrain() {
+        let phrase: Vec<i32> = (100..109).collect(); // 9-token block
+
+        // Dominant loop: phrase × 50 → covers ~100% of the tokens → flagged.
+        let mut loopy = Vec::new();
+        for _ in 0..50 {
+            loopy.extend_from_slice(&phrase);
+        }
+        assert!(is_repetition_loop(&loopy, 32, 4));
+
+        // Brief refrain: 300 distinct tokens then the phrase ×4 at the tail. The block repeats
+        // >= 4 times (so the raw detector fires), but covers only 36/336 ≈ 11% → NOT flagged.
+        let mut refrain: Vec<i32> = (1000..1300).collect();
+        for _ in 0..4 {
+            refrain.extend_from_slice(&phrase);
+        }
+        assert!(stream_tail_repeat_blocks(&refrain, 32).0 >= 4, "raw detector still fires");
+        assert!(!is_repetition_loop(&refrain, 32, 4), "but coverage gate rejects the refrain");
+    }
+
+    // ── Sync to C: suppress_repeat_token_runs (QWEN_STREAM_MAX_REPEAT_TOKEN_RUN) ──
+    #[test]
+    fn suppress_trims_single_token_run_to_max() {
+        let mut chunk = vec![9i32; 20];
+        let dropped = suppress_repeat_token_runs(&[1, 2, 3], &mut chunk, 12);
+        assert_eq!(chunk.len(), 12, "a 20-long run of one token trims to max_run=12");
+        assert!(chunk.iter().all(|&t| t == 9));
+        // 20 - 12 = 8 dropped, which reaches STREAM_DEGEN_DROP_RESET → forces a re-anchor (C parity).
+        assert_eq!(dropped, 8);
+        assert!(dropped >= STREAM_DEGEN_DROP_RESET);
+    }
+
+    #[test]
+    fn suppress_continues_run_from_prefix_tail() {
+        // prefix already ends in three 9s, so only 9 more fit before the run hits 12.
+        let mut chunk = vec![9i32; 20];
+        suppress_repeat_token_runs(&[9, 9, 9], &mut chunk, 12);
+        assert_eq!(chunk.len(), 9);
+    }
+
+    #[test]
+    fn suppress_is_noop_when_max_run_below_one() {
+        let mut chunk = vec![9i32; 20];
+        suppress_repeat_token_runs(&[], &mut chunk, 0);
+        assert_eq!(chunk.len(), 20);
+    }
+
+    // ── Word-boundary halving: find_split_point lands in a silence gap ──
+    // The recovery halves a degenerate clip at find_split_point(midpoint, ±search) so the cut
+    // falls between words (lowest energy), not mid-word.
+    #[test]
+    fn find_split_point_lands_in_silence_gap() {
+        let sr = SAMPLE_RATE as usize;
+        let mut samples = vec![1.0f32; 10 * sr]; // 10s of "speech"
+        let gap_lo = 5 * sr - sr / 4; // 0.5s silent gap centered at 5s
+        let gap_hi = 5 * sr + sr / 4;
+        for s in samples[gap_lo..gap_hi].iter_mut() {
+            *s = 0.0;
+        }
+        let split = find_split_point(&samples, 5 * sr, 3.0);
+        assert!(
+            split >= gap_lo && split <= gap_hi,
+            "split {split} should land in the silent gap [{gap_lo},{gap_hi}], not mid-word"
+        );
+    }
 }

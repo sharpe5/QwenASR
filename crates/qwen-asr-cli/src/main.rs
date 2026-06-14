@@ -7,7 +7,7 @@ mod serve;
 
 use qwen_asr::{audio, config, context, kernels, transcribe, align};
 use config::*;
-use context::QwenCtx;
+use context::{DecodeSettings, PastText, QwenCtx};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -308,6 +308,9 @@ fn usage(prog: &str) {
     fn opt(label: &str, desc: &str) {
         eprintln!("  {:<27}  {}", label, desc);
     }
+    // Default strings come from the ONE source (DecodeSettings) so help can't drift
+    // from runtime — the old hand-written literals had (e.g. stream-chunk "2.0" vs 8.0).
+    let d = DecodeSettings::default();
 
     eprintln!("qwen-asr — Qwen3-ASR speech-to-text (pure Rust)\n");
     eprintln!("Usage: {} -d <model_dir> (-i <input> | --stdin | --live) [options]\n", prog);
@@ -323,14 +326,20 @@ fn usage(prog: &str) {
     opt("--vad", "Live VAD mode: detect speech segments, transcribe each (default: off)");
     eprintln!("\nOptions:");
     opt("-t <n>", "Number of threads (default: all CPUs, capped at 10)");
-    opt("-S <secs>", "Segment target seconds (default: 30; 0 = full-audio decode). Audio is split into ~30s segments because decoding longer spans makes the model loop and repeat itself; keep this near 30 unless you know what you're doing.");
+    opt("-S <secs>", &format!("Segment target seconds (default: {}; 0 = full-audio decode). Audio is split into ~30s segments because decoding longer spans makes the model loop and repeat itself; keep this near 30 unless you know what you're doing.", d.segment_sec));
     opt("--weights <f32|bf16>", "Weight residency (default: f32). 'bf16' keeps projection weights BF16-resident (widened per matmul) instead of f32 copies — roughly halves weight RAM, identical math, slightly slower per process.");
-    opt("-W <secs>", "Segment-cutting silence search window ± seconds (default: 3.0)");
+    opt("-W <secs>", &format!("Segment-cutting silence search window ± seconds (default: {})", d.search_sec));
     opt("--stream", "Streaming mode: process in chunks with prefix rollback (default: off)");
-    opt("--stream-max-new-tokens <n>", "Max generated tokens per stream step (default: 32)");
-    opt("--stream-chunk-sec <secs>", "Chunk size for streaming (default: 2.0, min ~1.0)");
+    opt("--stream-max-new-tokens <n>", &format!("Max generated tokens per stream step (default: {})", d.stream_max_new_tokens));
+    opt("--stream-chunk-sec <secs>", &format!("Chunk size for streaming (default: {}, min ~1.0)", d.stream_chunk_sec));
     opt("--enc-window-sec <secs>", "Encoder attention window in seconds (1..8, default: 8)");
     opt("--past-text <yes|no|auto>", "Reuse previously decoded text as context (default: auto — yes for --stream, else no)");
+    // Loop / repetition handling. Detection thresholds are fixed constants (not tunable);
+    // --loop-detect toggles detection+recovery in both --stream and the segment/--serve path,
+    // and the two recovery bounds apply only to the segment path's halve-&-re-decode.
+    opt("--loop-detect <yes|no>", &format!("Detect & recover from decoder repetition loops, --stream + segment (default: {})", if d.loop_detect { "yes" } else { "no" }));
+    opt("--loop-min-split-sec <secs>", &format!("Segment recovery: don't re-split a degenerate clip below this (default: {})", d.loop_min_split_sec));
+    opt("--loop-max-depth <n>", &format!("Segment recovery: max halvings, e.g. 32->16->8 (0 disables) (default: {})", d.loop_max_depth));
     opt("--skip-silence", "Drop long silent spans before inference (default: off)");
     opt("--prompt <text>", "System prompt for biasing (default: none)");
     opt("--language <lang>", "Force output language (REQUIRED). The audio is decoded in ~30s segments to avoid repetition loops, and the model re-detects the language on each segment independently — so without a fixed language it guesses wrong on some blocks and quality suffers. Set this to lock the language for the whole file.");
@@ -354,21 +363,61 @@ fn usage(prog: &str) {
     opt("-v, --version", "Show version and exit");
 }
 
-fn parse_past_text_mode(s: &str) -> Option<i32> {
+/// Shared yes/no flag-value vocabulary (`--loop-detect`, and the yes/no half of `--past-text`),
+/// so the accepted spellings live in ONE place and can't drift between flags.
+fn parse_bool_flag(s: &str) -> Option<bool> {
     match s.to_lowercase().as_str() {
-        "yes" => Some(1),
-        "no" => Some(0),
-        "auto" => Some(-1),
+        "yes" | "true" | "on" | "1" => Some(true),
+        "no" | "false" | "off" | "0" => Some(false),
         _ => None,
+    }
+}
+
+fn parse_past_text_mode(s: &str) -> Option<i32> {
+    if s.eq_ignore_ascii_case("auto") {
+        return Some(-1);
+    }
+    parse_bool_flag(s).map(|b| if b { 1 } else { 0 })
+}
+
+/// Parse a required integer flag value with a minimum, exiting on missing/unparseable/
+/// below-min (strict, like `--loop-detect`) so a typo or out-of-range value is never silently
+/// swallowed into the default. `min` lets a knob admit 0 as "disable" (token-run, depth) while
+/// others require >= 1.
+fn parse_min_i32(args: &[String], i: usize, flag: &str, min: i32) -> i32 {
+    match args.get(i).and_then(|s| s.parse::<i32>().ok()) {
+        Some(v) if v >= min => v,
+        _ => {
+            eprintln!("Error: {flag} requires an integer >= {min}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Float analog of [`parse_min_i32`].
+fn parse_min_f32(args: &[String], i: usize, flag: &str, min: f32) -> f32 {
+    match args.get(i).and_then(|s| s.parse::<f32>().ok()) {
+        Some(v) if v >= min => v,
+        _ => {
+            eprintln!("Error: {flag} requires a number >= {min}");
+            std::process::exit(1);
+        }
     }
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // Handle --version / -v (no model needed)
+    // Handle --version / -v (no model needed). `--json` emits the machine-readable form
+    // the version-lockstep check reads: {"engine","version"} — the same engine/version
+    // the serve READY frame advertises, so the check can confirm the BUILT binary matches
+    // the protocol version without loading a model.
     if args.iter().any(|a| a == "--version" || a == "-v") {
-        println!("qwen-asr {}", env!("CARGO_PKG_VERSION"));
+        if args.iter().any(|a| a == "--json") {
+            println!("{{\"engine\":\"qwen\",\"version\":\"{}\"}}", env!("CARGO_PKG_VERSION"));
+        } else {
+            println!("qwen-asr {}", env!("CARGO_PKG_VERSION"));
+        }
         return;
     }
 
@@ -410,6 +459,10 @@ fn main() {
     let mut force_language: Option<String> = None;
     let mut past_text_mode: i32 = -1; // -1 auto, 0 off, 1 on
     let mut skip_silence = false;
+    // Loop/repetition handling overrides (-1 / -1.0 = unset → keep DecodeSettings default).
+    let mut loop_detect: i32 = -1; // -1 unset, 0 off, 1 on
+    let mut loop_min_split_sec: f32 = -1.0;
+    let mut loop_max_depth: i32 = -1;
     let mut profile = false;
     let mut align_text: Option<String> = None;
     let mut align_language: Option<String> = None;
@@ -469,6 +522,27 @@ fn main() {
             "--enc-window-sec" => {
                 i += 1;
                 enc_window_sec = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(-1.0);
+            }
+            "--loop-detect" => {
+                i += 1;
+                loop_detect = match args.get(i).and_then(|s| parse_bool_flag(s)) {
+                    Some(true) => 1,
+                    Some(false) => 0,
+                    None => {
+                        eprintln!("Error: --loop-detect must be yes|no, got '{}'",
+                                  args.get(i).map(|s| s.as_str()).unwrap_or(""));
+                        std::process::exit(1);
+                    }
+                };
+            }
+            "--loop-min-split-sec" => {
+                i += 1;
+                loop_min_split_sec = parse_min_f32(&args, i, "--loop-min-split-sec", 0.0);
+            }
+            "--loop-max-depth" => {
+                // min 0: 0 disables recovery halving entirely.
+                i += 1;
+                loop_max_depth = parse_min_i32(&args, i, "--loop-max-depth", 0);
             }
             "--past-text" => {
                 i += 1;
@@ -596,11 +670,47 @@ fn main() {
         }
     }
 
+    // Build decode settings from the gold-standard defaults, then override per flag — the
+    // sentinels (<0 / <=0 / mode<0) mean "flag not given → keep the default". Built ONCE here,
+    // BEFORE the serve dispatch, and passed verbatim to BOTH `--serve` and the one-shot CLI
+    // path, so the two can never decode differently (incl. every --loop-* knob and -S/-W).
+    let mut settings = DecodeSettings::default();
+    if segment_sec >= 0.0 {
+        settings.segment_sec = segment_sec;
+    }
+    if search_sec >= 0.0 {
+        settings.search_sec = search_sec;
+    }
+    if stream_max_new_tokens > 0 {
+        settings.stream_max_new_tokens = stream_max_new_tokens;
+    }
+    if stream_chunk_sec > 0.0 {
+        settings.stream_chunk_sec = stream_chunk_sec;
+    }
+    if past_text_mode >= 0 {
+        settings.past_text = if past_text_mode == 1 { PastText::On } else { PastText::Off };
+    }
+    if skip_silence {
+        settings.skip_silence = true;
+    }
+    // Loop/repetition overrides. The locals are the -1/-1.0 "unset" sentinel (flag absent) or a
+    // value already range-validated at parse time, so each knob applies whenever it's >= its
+    // minimum. token-run and depth admit 0 (disable); min-repeats/max-period require >= 1.
+    if loop_detect >= 0 {
+        settings.loop_detect = loop_detect == 1;
+    }
+    if loop_min_split_sec >= 0.0 {
+        settings.loop_min_split_sec = loop_min_split_sec;
+    }
+    if loop_max_depth >= 0 {
+        settings.loop_max_depth = loop_max_depth;
+    }
+
     // Resident serve mode: load the model (×`--workers`) once and answer many
     // requests over the AF_UNIX socket. Language/input/clip flags don't apply —
     // they travel per-request — so dispatch here, before the one-shot validation.
     if let Some(sock) = serve_sock {
-        serve::run(&sock, &model_dir, weights_bf16, serve_workers);
+        serve::run(&sock, &model_dir, weights_bf16, serve_workers, &settings);
         return; // serve::run loops until the socket closes
     }
 
@@ -720,30 +830,16 @@ fn main() {
         }
     };
 
-    // Apply settings
-    if segment_sec >= 0.0 {
-        ctx.segment_sec = segment_sec;
-    }
-    if search_sec >= 0.0 {
-        ctx.search_sec = search_sec;
-    }
+    // `settings` was built once above (shared verbatim with the `--serve` path, so CLI and
+    // serve can never decode differently). `apply_settings` resolves PastText::Auto from
+    // `stream_mode` (ON for streaming, OFF otherwise), matching the prior behaviour.
+    ctx.apply_settings(&settings, stream_mode);
+
+    // --enc-window-sec stays a PURE override of the model's config (its default is a
+    // model-architecture constant, not part of DecodeSettings — see its docs).
     if enc_window_sec >= 0.0 {
         let window_frames = (enc_window_sec * 100.0 + 0.5) as usize;
         ctx.enc_n_window_infer_override = Some(window_frames.clamp(100, 800));
-    }
-    if stream_max_new_tokens > 0 {
-        ctx.stream_max_new_tokens = stream_max_new_tokens;
-    }
-    if stream_chunk_sec > 0.0 {
-        ctx.stream_chunk_sec = stream_chunk_sec;
-    }
-    if past_text_mode >= 0 {
-        ctx.past_text_conditioning = past_text_mode == 1;
-    } else if stream_mode {
-        ctx.past_text_conditioning = true;
-    }
-    if skip_silence {
-        ctx.skip_silence = true;
     }
     if let Some(ref prompt) = prompt_text {
         if ctx.set_prompt(prompt).is_err() {

@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.9.1]
+
+### Features
+
+- **Loop / repetition detection & recovery in the segment (offline/`--serve`) path.** The
+  offline path previously only *observed* decoder degeneracy; it now detects it (maxed token
+  budget, or a tail block repeated ≥ 4 times via a wide period-32 detector AND covering ≥ half
+  the output — a coverage gate so a brief legitimate refrain isn't mistaken for a runaway loop)
+  and recovers by halving the clip at a word boundary and re-decoding each half, iteratively,
+  bounded by `--loop-max-depth` (3) and `--loop-min-split-sec` (8 s). Detection thresholds are
+  fixed constants (like the stream path); the only loop flags are `--loop-detect yes|no` (master
+  toggle, both paths) and the two recovery bounds. See `docs/loop-detection.md`.
+- **`--serve` honors all startup decode overrides** (`-S`/`-W`/`--loop-*`), built from one
+  `DecodeSettings` shared verbatim with the one-shot CLI — serve and CLI can no longer diverge.
+
+### Fixes
+
+- **Sync to the C reference**: port `QWEN_STREAM_MAX_REPEAT_TOKEN_RUN` (single-token-run
+  suppression) into the Rust `--stream` path, which had dropped it, *and* its companion
+  `dropped_repeat_tokens >= 8` recovery-reset trigger — when the guard trims ≥ 8 tokens in a
+  chunk the stream now re-anchors (matching `qwen_asr.c:1964`) instead of leaving the decoder
+  context poisoned.
+
 ## [0.2.3] - 2026-02-23
 
 ### Features

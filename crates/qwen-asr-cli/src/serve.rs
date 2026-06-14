@@ -39,7 +39,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use serde::Deserialize;
 
 use qwen_asr::config::SUPPORTED_LANGUAGES;
-use qwen_asr::context::{QwenCtx, QwenModel};
+use qwen_asr::context::{DecodeSettings, QwenCtx, QwenModel};
 use qwen_asr::{kernels, transcribe};
 
 use crate::{format_json, load_audio};
@@ -116,7 +116,8 @@ impl CtxPool {
 
 /// Load `workers` resident contexts, bind the socket, and serve forever. Returns
 /// only on a fatal bind/load error (via `process::exit`); otherwise loops.
-pub fn run(sock: &str, model_dir: &str, weights_bf16: bool, workers: usize) {
+pub fn run(sock: &str, model_dir: &str, weights_bf16: bool, workers: usize,
+           settings: &DecodeSettings) {
     // Single-threaded matmul → inline on each connection thread, shared pool
     // untouched (see module docs). Parallelism is across connections, not within.
     kernels::set_threads(1);
@@ -132,9 +133,15 @@ pub fn run(sock: &str, model_dir: &str, weights_bf16: bool, workers: usize) {
             std::process::exit(1);
         }
     };
+    // Apply the SAME DecodeSettings the CLI built from argv (defaults + any -S/-W/--loop-*
+    // overrides), passed in by main — the VISIBLE contract that `--serve` decodes identically
+    // to the one-shot CLI for the same flags, and can't silently drift.
+    // stream_mode=false: serve always runs the segmented/clips file path, never --stream.
     let mut ctxs = Vec::with_capacity(n);
     for _ in 0..n {
-        ctxs.push(QwenCtx::from_model(model.clone()));
+        let mut ctx = QwenCtx::from_model(model.clone());
+        ctx.apply_settings(settings, false);
+        ctxs.push(ctx);
     }
     let pool = Arc::new(CtxPool { free: Mutex::new(ctxs), cv: Condvar::new() });
 

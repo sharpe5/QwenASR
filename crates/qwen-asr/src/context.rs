@@ -102,6 +102,87 @@ impl QwenModel {
 ///
 /// Create with [`QwenCtx::load`], then pass to functions in the [`crate::transcribe`] module.
 ///
+/// `--past-text` tri-state. `Auto` resolves to ON for streaming and OFF otherwise —
+/// that resolution depends on HOW the audio is fed (a run-mode decision, not a fixed
+/// default), so it happens in [`QwenCtx::apply_settings`], not here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PastText {
+    Auto,
+    On,
+    Off,
+}
+
+/// The SINGLE source of truth for every decode default shared by the CLI and `--serve`.
+///
+/// The CLI defaults are the gold standard, and `DecodeSettings::default()` IS that
+/// table — written once, consumed everywhere:
+///   * [`QwenCtx::from_model`] builds its decode fields from it (so a bare ctx already
+///     carries the gold-standard defaults),
+///   * the CLI starts from it and overrides per command-line flag,
+///   * `--serve` applies it verbatim to every resident ctx (so serve can NEVER drift
+///     from the CLI defaults — the whole point), and
+///   * the CLI `--help` default strings are formatted from it (so the docs can't drift
+///     either; the old hand-written "default: …" literals had already gone stale).
+/// Change a default HERE and it changes in all four places at once.
+///
+/// `--enc-window-sec`'s default is intentionally NOT here: the encoder attention window
+/// is a model-architecture knob whose default lives in the model's own
+/// `config.enc_n_window_infer`, and the flag is a pure override of that
+/// (`enc_n_window_infer_override`). Folding it in would duplicate a model constant.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecodeSettings {
+    /// `-S`: segment target seconds for long audio (0 = full-audio, no splitting).
+    /// ~30 keeps the model from looping/repeating on long spans.
+    pub segment_sec: f32,
+    /// `-W`: ± seconds silence-search window when cutting segments.
+    pub search_sec: f32,
+    /// `--past-text`: reuse previously decoded text as decode context.
+    pub past_text: PastText,
+    /// `--skip-silence`: drop long silent spans before inference.
+    pub skip_silence: bool,
+    /// `--stream-chunk-sec`: chunk size in streaming mode.
+    pub stream_chunk_sec: f32,
+    /// `--stream-max-new-tokens`: max generated tokens per streaming step.
+    pub stream_max_new_tokens: i32,
+    pub stream_rollback: i32,
+    pub stream_unfixed_chunks: i32,
+    // Loop / repetition handling. The detection THRESHOLDS (period / min-reps / token-run) are
+    // not runtime-tunable — they're constants in `transcribe.rs` (the stream path proves hard-
+    // coded values are fine, and nobody needs to tune a degeneracy detector per run). The only
+    // loop knobs here are the on/off switch and the segment-recovery bounds.
+    /// `--loop-detect`: master switch — detect & recover from decoder repetition loops (both the
+    /// --stream and segment/--serve paths). When false, neither path detects or recovers.
+    pub loop_detect: bool,
+    /// `--loop-min-split-sec`: segment-recovery size floor — only split spans >= 2× this.
+    pub loop_min_split_sec: f32,
+    /// `--loop-max-depth`: segment-recovery max halving depth (e.g. 32→16→8 at the 8s floor).
+    pub loop_max_depth: i32,
+}
+
+impl Default for DecodeSettings {
+    fn default() -> Self {
+        // ─── THE gold-standard decode defaults (one number each, the only copy) ───
+        DecodeSettings {
+            segment_sec: 30.0,
+            search_sec: 3.0,
+            past_text: PastText::Auto,
+            skip_silence: false,
+            // 8.0 is the runtime gold standard; the CLI help string had drifted to "2.0".
+            stream_chunk_sec: 8.0,
+            stream_max_new_tokens: 32,
+            stream_rollback: 5,
+            stream_unfixed_chunks: 99,
+            loop_detect: true,
+            // Recovery floor 8s: the shortest segment recovery emits is 8s — spans < 16s
+            // (= 2× the floor) aren't split — so a typical <=33s coarse segment goes 32 -> 16 ->
+            // 8 and stops. loop_max_depth=3 caps total halvings for any larger span; for the
+            // common case the 8s floor is the binding stop.
+            loop_min_split_sec: 8.0,
+            loop_max_depth: 3,
+        }
+    }
+}
+
 /// # Configurable fields
 ///
 /// | Field | Default | Description |
@@ -141,6 +222,23 @@ pub struct QwenCtx {
     pub stream_max_new_tokens: i32,
     pub past_text_conditioning: bool,
     pub skip_silence: bool,
+
+    // Loop / repetition-degeneracy handling (see DecodeSettings + docs/loop-detection.md). The
+    // detection thresholds are constants in transcribe.rs; only the on/off switch and the
+    // segment-recovery bounds are per-ctx settings.
+    /// Master switch (`--loop-detect`). When false, no detection/recovery runs in either
+    /// path — decode is byte-for-byte the legacy behavior. Default true.
+    pub loop_detect: bool,
+    /// Segment-recovery size floor in seconds (`--loop-min-split-sec`, default 8.0): a clip is
+    /// only halved when it is at least 2× this (>= 16s), so the shortest segment recovery emits
+    /// is 8s and short segments are never over-split. The floor gates WHETHER to split, not the
+    /// exact half sizes — the cut follows the word gap (lowest-energy point near the midpoint),
+    /// so halves can be uneven and one may end up below this; that half just isn't split again.
+    pub loop_min_split_sec: f32,
+    /// Segment-recovery depth cap (`--loop-max-depth`, default 3): at most this many halvings,
+    /// so a 32s degenerate clip goes 32→16→8 (stopping at the 8s floor) and larger spans split
+    /// no more than 3 times.
+    pub loop_max_depth: i32,
 
     /// Per-ctx override for `config.enc_n_window_infer` (CLI `--enc-window-sec`).
     /// `config` is now shared/read-only, so the override lives here and is folded
@@ -202,6 +300,11 @@ impl QwenCtx {
         let kv_cache = KvCache::new(cfg.dec_layers, 2048, cfg.dec_kv_heads, cfg.dec_head_dim);
         let dec_bufs = DecoderBuffers::new(cfg);
 
+        // Decode fields come from the SINGLE source of truth (DecodeSettings), so a
+        // bare ctx — including every `--serve` resident ctx — already carries the
+        // gold-standard CLI defaults. `Auto` past-text resolves to OFF for a
+        // freshly-built (non-streaming) ctx, matching the historical `false`.
+        let d = DecodeSettings::default();
         QwenCtx {
             model,
             kv_cache,
@@ -209,14 +312,17 @@ impl QwenCtx {
             enc_bufs: EncoderBuffers::new(),
             rope_cache: RopeCache::new(),
             token_cb: None,
-            segment_sec: 30.0,
-            search_sec: 3.0,
-            stream_chunk_sec: 8.0,
-            stream_rollback: 5,
-            stream_unfixed_chunks: 99,
-            stream_max_new_tokens: 32,
-            past_text_conditioning: false,
-            skip_silence: false,
+            segment_sec: d.segment_sec,
+            search_sec: d.search_sec,
+            stream_chunk_sec: d.stream_chunk_sec,
+            stream_rollback: d.stream_rollback,
+            stream_unfixed_chunks: d.stream_unfixed_chunks,
+            stream_max_new_tokens: d.stream_max_new_tokens,
+            past_text_conditioning: matches!(d.past_text, PastText::On),
+            skip_silence: d.skip_silence,
+            loop_detect: d.loop_detect,
+            loop_min_split_sec: d.loop_min_split_sec,
+            loop_max_depth: d.loop_max_depth,
             enc_n_window_infer_override: None,
             prompt: None,
             force_language: None,
@@ -231,6 +337,31 @@ impl QwenCtx {
             perf_segments: 0,
             perf_maxed_segments: 0,
         }
+    }
+
+    /// Apply a [`DecodeSettings`] onto this ctx's decode fields — the ONE place
+    /// settings become ctx state, shared by `from_model` (gold-standard defaults), the
+    /// CLI (defaults + flag overrides) and `--serve` (defaults). `stream_mode` resolves
+    /// `PastText::Auto` (ON for streaming, OFF otherwise), since that choice depends on
+    /// how the audio is fed, not on a fixed default. Does NOT touch `prompt` /
+    /// `force_language` / `enc_n_window_infer_override` — those are per-invocation
+    /// overrides, not part of the shared default table.
+    pub fn apply_settings(&mut self, s: &DecodeSettings, stream_mode: bool) {
+        self.segment_sec = s.segment_sec;
+        self.search_sec = s.search_sec;
+        self.stream_chunk_sec = s.stream_chunk_sec;
+        self.stream_rollback = s.stream_rollback;
+        self.stream_unfixed_chunks = s.stream_unfixed_chunks;
+        self.stream_max_new_tokens = s.stream_max_new_tokens;
+        self.skip_silence = s.skip_silence;
+        self.loop_detect = s.loop_detect;
+        self.loop_min_split_sec = s.loop_min_split_sec;
+        self.loop_max_depth = s.loop_max_depth;
+        self.past_text_conditioning = match s.past_text {
+            PastText::On => true,
+            PastText::Off => false,
+            PastText::Auto => stream_mode,
+        };
     }
 
     /// Set an optional text prompt to guide transcription. Pass an empty string to clear.
@@ -311,5 +442,27 @@ impl QwenCtx {
         self.perf_decode_ms = 0.0;
         self.perf_segments = 0;
         self.perf_maxed_segments = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locks the gold-standard loop defaults. This is the serve/CLI **parity guard**: both the
+    /// one-shot CLI and `--serve` build their settings from this single `DecodeSettings::default()`
+    /// (`main` builds it once and hands the SAME value to `serve::run` and `apply_settings`), and
+    /// `apply_settings` copies the fields verbatim — so the only place a default could diverge is
+    /// this table, and any drift fails here.
+    ///
+    /// (We do NOT assert `apply_settings`'s ctx copy directly: a `QwenCtx` needs a loaded model,
+    /// so it belongs in an integration test, not a unit test. The straight-line field copy in
+    /// `apply_settings` is compile-checked; this test guards the values it copies.)
+    #[test]
+    fn loop_defaults_are_gold_standard() {
+        let d = DecodeSettings::default();
+        assert!(d.loop_detect);
+        assert_eq!(d.loop_min_split_sec, 8.0);
+        assert_eq!(d.loop_max_depth, 3);
     }
 }
