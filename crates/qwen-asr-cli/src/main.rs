@@ -651,6 +651,22 @@ fn main() {
 
     // Auto-prompt to download if model directory doesn't exist
     if !std::path::Path::new(&model_dir).exists() {
+        // --serve runs unattended (e.g. the coproc worker spawns it with stdin closed),
+        // so it must NOT enter the interactive download prompt below (an empty/EOF reply
+        // would default to "yes" and silently pull ~1.8 GB mid-launch). Fail fast instead,
+        // showing how to fetch the weights, and let the operator rerun --serve.
+        if serve_sock.is_some() {
+            let name = std::path::Path::new(&model_dir)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&model_dir);
+            eprintln!("serve: model weights not found at '{}'.", model_dir);
+            eprintln!("Fetch them once, then relaunch --serve:");
+            eprintln!("    {} download {}", args[0], name);
+            eprintln!("(downloads ~1.8 GB into ./{name}/; put it beside the binary or in any \
+                       parent dir up to the repo root so --serve finds it automatically.)");
+            std::process::exit(2);
+        }
         if let Some(model) = download::find_model(&model_dir) {
             if download::prompt_download(&model_dir) {
                 if let Err(e) = download::download_model(model, &model_dir) {
