@@ -192,14 +192,15 @@ struct ThreadPool {
     done_atomic: AtomicUsize,
     fn_ptr_atomic: AtomicUsize,
     fn_call_atomic: AtomicUsize,
-    n_threads_atomic: AtomicUsize,
+    n_threads_atomic: AtomicUsize, // active threads for the in-flight dispatch
+    configured: AtomicUsize,       // this pool's thread count
+    spawned: AtomicUsize,          // workers spawned for this pool
+    id: u64,                       // for worker naming
 }
 
-static THREAD_POOL: OnceLock<Arc<ThreadPool>> = OnceLock::new();
-
-fn get_pool() -> &'static Arc<ThreadPool> {
-    THREAD_POOL.get_or_init(|| {
-        Arc::new(ThreadPool {
+impl ThreadPool {
+    fn new_arc(n: usize, id: u64) -> Arc<ThreadPool> {
+        let p = Arc::new(ThreadPool {
             state: Mutex::new(false),
             work_cv: Condvar::new(),
             gen_atomic: AtomicU64::new(0),
@@ -207,8 +208,60 @@ fn get_pool() -> &'static Arc<ThreadPool> {
             fn_ptr_atomic: AtomicUsize::new(0),
             fn_call_atomic: AtomicUsize::new(0),
             n_threads_atomic: AtomicUsize::new(1),
-        })
-    })
+            configured: AtomicUsize::new(n.max(1)),
+            spawned: AtomicUsize::new(0),
+            id,
+        });
+        if n > 1 {
+            p.ensure_workers(n);
+        }
+        p
+    }
+
+    fn ensure_workers(self: &Arc<Self>, n_threads: usize) {
+        let spawned = self.spawned.load(Ordering::Relaxed);
+        if spawned >= n_threads - 1 {
+            return;
+        }
+        for tid in (spawned + 1)..n_threads {
+            let p = self.clone();
+            thread::Builder::new()
+                .name(format!("qwen-p{}-w{}", self.id, tid))
+                .spawn(move || pool_worker(p, tid))
+                .expect("failed to spawn worker thread");
+        }
+        self.spawned.store(n_threads - 1, Ordering::Relaxed);
+    }
+}
+
+// Two pools, each with its own workers + dispatch atomics, so two OS threads
+// (the main/decoder lane and the pipelined encoder lane) can run parallel
+// kernels concurrently without corrupting a shared dispatch slot. A thread-local
+// selects which pool the calling thread uses (default = decoder pool).
+fn default_pool() -> &'static Arc<ThreadPool> {
+    static DEFAULT_POOL: OnceLock<Arc<ThreadPool>> = OnceLock::new();
+    DEFAULT_POOL.get_or_init(|| ThreadPool::new_arc(1, 0))
+}
+
+static ENCODER_POOL: OnceLock<Arc<ThreadPool>> = OnceLock::new();
+
+thread_local! {
+    static CURRENT_POOL: std::cell::RefCell<Option<Arc<ThreadPool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn current_pool() -> Arc<ThreadPool> {
+    CURRENT_POOL
+        .with(|c| c.borrow().clone())
+        .unwrap_or_else(|| default_pool().clone())
+}
+
+/// Install a dedicated pool on THIS thread (the pipelined encoder lane) so its
+/// parallel kernels never share dispatch state with the main/decoder pool.
+pub fn use_encoder_pool(n: usize) {
+    let n = n.clamp(1, MAX_THREADS);
+    let p = ENCODER_POOL.get_or_init(|| ThreadPool::new_arc(n, 1)).clone();
+    CURRENT_POOL.with(|c| *c.borrow_mut() = Some(p));
 }
 
 fn pool_worker(pool: Arc<ThreadPool>, tid: usize) {
@@ -256,32 +309,12 @@ fn pool_worker(pool: Arc<ThreadPool>, tid: usize) {
     }
 }
 
-static SPAWNED_THREADS: AtomicUsize = AtomicUsize::new(0);
-
-fn ensure_workers(pool: &Arc<ThreadPool>, n_threads: usize) {
-    let spawned = SPAWNED_THREADS.load(Ordering::Relaxed);
-    if spawned >= n_threads - 1 {
-        return;
-    }
-    let start = spawned + 1;
-    for tid in start..n_threads {
-        let p = pool.clone();
-        thread::Builder::new()
-            .name(format!("qwen-worker-{}", tid))
-            .spawn(move || pool_worker(p, tid))
-            .expect("failed to spawn worker thread");
-    }
-    SPAWNED_THREADS.store(n_threads - 1, Ordering::Relaxed);
-}
-
-static THREAD_POOL_THREADS: AtomicUsize = AtomicUsize::new(1);
-
 pub fn set_threads(n: usize) {
     let n = n.clamp(1, MAX_THREADS);
-    THREAD_POOL_THREADS.store(n, Ordering::Relaxed);
+    let pool = default_pool();
+    pool.configured.store(n, Ordering::Relaxed);
     if n > 1 {
-        let pool = get_pool();
-        ensure_workers(pool, n);
+        pool.ensure_workers(n);
     }
     if verbose() >= 2 {
         eprintln!("Thread pool: {} threads", n);
@@ -289,7 +322,7 @@ pub fn set_threads(n: usize) {
 }
 
 pub fn get_num_threads() -> usize {
-    THREAD_POOL_THREADS.load(Ordering::Relaxed)
+    current_pool().configured.load(Ordering::Relaxed)
 }
 
 pub fn get_num_cpus() -> usize {
@@ -301,13 +334,12 @@ pub fn get_num_cpus() -> usize {
 /// Run a closure in parallel using the persistent thread pool.
 /// The closure takes (thread_id, n_threads).
 fn parallel_for<F: Fn(usize, usize) + Send + Sync>(f: F) {
-    let n_threads = get_num_threads();
+    let pool = current_pool();
+    let n_threads = pool.configured.load(Ordering::Relaxed);
     if n_threads <= 1 {
         f(0, 1);
         return;
     }
-
-    let pool = get_pool();
 
     // Trampoline: cast *const () back to &F and call it
     fn trampoline<F: Fn(usize, usize) + Send + Sync>(ptr: *const (), tid: usize, nt: usize) {

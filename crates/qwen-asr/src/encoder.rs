@@ -19,8 +19,53 @@ unsafe impl Send for Wt {}
 unsafe impl Sync for Wt {}
 
 impl Wt {
+    /// Stable identity of this weight matrix (for the ANE model cache).
+    #[cfg(all(target_os = "macos", feature = "mac-ane"))]
+    #[inline]
+    fn ptr_key(&self) -> usize {
+        match self {
+            Wt::F32(w) => w.as_ptr() as usize,
+            Wt::Bf16(p) => *p as usize,
+        }
+    }
+
+    /// Row-major `[out_dim, in_dim]` f32 weights (widening BF16 if needed).
+    /// Only called on an ANE cache miss.
+    #[cfg(all(target_os = "macos", feature = "mac-ane"))]
+    fn to_f32_weights(&self, in_dim: usize, out_dim: usize) -> Vec<f32> {
+        match self {
+            Wt::F32(w) => w.clone(),
+            Wt::Bf16(p) => {
+                let n = in_dim * out_dim;
+                let src = unsafe { std::slice::from_raw_parts(*p, n) };
+                let mut v = vec![0.0f32; n];
+                kernels::bf16_to_f32_buf(&mut v, src);
+                v
+            }
+        }
+    }
+
     #[inline]
     fn linear(&self, y: &mut [f32], x: &[f32], b: Option<&[f32]>, seq: usize, in_dim: usize, out_dim: usize) {
+        #[cfg(all(target_os = "macos", feature = "mac-ane"))]
+        {
+            if let Some(ym) = crate::mac_ane::try_linear(
+                self.ptr_key(), x, in_dim, out_dim, seq,
+                || self.to_f32_weights(in_dim, out_dim),
+            ) {
+                match b {
+                    Some(b) => {
+                        for s in 0..seq {
+                            for o in 0..out_dim {
+                                y[s * out_dim + o] = ym[s * out_dim + o] + b[o];
+                            }
+                        }
+                    }
+                    None => y[..seq * out_dim].copy_from_slice(&ym),
+                }
+                return;
+            }
+        }
         match self {
             Wt::F32(w) => kernels::linear(y, x, w, b, seq, in_dim, out_dim),
             Wt::Bf16(p) => kernels::linear_bf16(y, x, *p, b, seq, in_dim, out_dim),
@@ -28,6 +73,16 @@ impl Wt {
     }
     #[inline]
     fn linear_nobias(&self, y: &mut [f32], x: &[f32], seq: usize, in_dim: usize, out_dim: usize) {
+        #[cfg(all(target_os = "macos", feature = "mac-ane"))]
+        {
+            if let Some(ym) = crate::mac_ane::try_linear(
+                self.ptr_key(), x, in_dim, out_dim, seq,
+                || self.to_f32_weights(in_dim, out_dim),
+            ) {
+                y[..seq * out_dim].copy_from_slice(&ym);
+                return;
+            }
+        }
         match self {
             Wt::F32(w) => kernels::linear_nobias(y, x, w, seq, in_dim, out_dim),
             Wt::Bf16(p) => kernels::linear_nobias_bf16(y, x, *p, seq, in_dim, out_dim),
@@ -35,6 +90,29 @@ impl Wt {
     }
     #[inline]
     fn linear_accumulate(&self, y: &mut [f32], x: &[f32], b: Option<&[f32]>, seq: usize, in_dim: usize, out_dim: usize) {
+        #[cfg(all(target_os = "macos", feature = "mac-ane"))]
+        {
+            if let Some(ym) = crate::mac_ane::try_linear(
+                self.ptr_key(), x, in_dim, out_dim, seq,
+                || self.to_f32_weights(in_dim, out_dim),
+            ) {
+                match b {
+                    Some(b) => {
+                        for s in 0..seq {
+                            for o in 0..out_dim {
+                                y[s * out_dim + o] += ym[s * out_dim + o] + b[o];
+                            }
+                        }
+                    }
+                    None => {
+                        for i in 0..seq * out_dim {
+                            y[i] += ym[i];
+                        }
+                    }
+                }
+                return;
+            }
+        }
         match self {
             Wt::F32(w) => kernels::linear_accumulate(y, x, w, b, seq, in_dim, out_dim),
             Wt::Bf16(p) => kernels::linear_accumulate_bf16(y, x, *p, b, seq, in_dim, out_dim),

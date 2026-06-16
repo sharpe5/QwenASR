@@ -2,12 +2,27 @@
 
 use crate::audio;
 use crate::config::*;
-use crate::context::QwenCtx;
+use crate::context::{QwenCtx, QwenModel};
 use crate::decoder::{self, tok_embed_bf16_to_f32};
+use crate::encoder::EncoderBuffers;
 use crate::kernels;
 use crate::tokenizer::QwenTokenizer;
 
 use std::time::Instant;
+
+/// Mel + encoder forward for one audio slice → `(encoder output, seq_len)`.
+/// Pure over `&QwenModel` + its own `EncoderBuffers`, so it runs in a background
+/// thread (encoder on the ANE) while the main thread decodes the previous
+/// segment on the CPU — see the pipelined path in [`transcribe_audio`].
+fn encode_segment(
+    model: &QwenModel,
+    cfg: &QwenConfig,
+    enc_bufs: &mut EncoderBuffers,
+    samples: &[f32],
+) -> Option<(Vec<f32>, usize)> {
+    let (mel, mel_frames) = audio::mel_spectrogram(samples)?;
+    model.encoder.forward(cfg, &mel, mel_frames, Some(enc_bufs))
+}
 
 // Prompt token sequences
 const PREFIX_HEAD: &[i32] = &[151644, 8948, 198];
@@ -172,6 +187,7 @@ fn transcribe_segment(
     samples: &[f32],
     tokenizer: &QwenTokenizer,
     past_tokens: Option<&[i32]>,
+    pre_enc: Option<(Vec<f32>, usize)>,
 ) -> Option<(String, i32, bool)> {
     let mut cfg_owned = ctx.model.config.clone();
     if let Some(w) = ctx.enc_n_window_infer_override {
@@ -182,20 +198,16 @@ fn transcribe_segment(
     let seg_t0 = get_time_ms();
     let mut n_text_tokens = 0i32;
 
-    // Mel spectrogram
+    // Mel + Encoder (or reuse a pre-computed encoding from the pipeline worker).
     let t0 = get_time_ms();
-    let (mel, mel_frames) = audio::mel_spectrogram(samples)?;
-    let mel_ms = elapsed_ms(t0);
-
-    if kernels::verbose() >= 2 {
-        eprintln!("  Mel: {} frames ({:.0} ms)", mel_frames, mel_ms);
-    }
-
-    // Encoder
-    let t0 = get_time_ms();
-    let (enc_output, enc_seq_len) =
-        ctx.model.encoder
-            .forward(cfg, &mel, mel_frames, Some(&mut ctx.enc_bufs))?;
+    let (enc_output, enc_seq_len) = match pre_enc {
+        Some(e) => e,
+        None => {
+            let model = ctx.model.clone();
+            encode_segment(&model, cfg, &mut ctx.enc_bufs, samples)?
+        }
+    };
+    let mel_ms = 0.0;
     let enc_ms = elapsed_ms(t0);
 
     if kernels::verbose() >= 2 {
@@ -360,6 +372,18 @@ fn transcribe_segment(
     let mut text_tokens: Vec<i32> = Vec::new();
     let mut tmp_embed = vec![0.0f32; dim];
 
+    // Lookahead (Jacobi) decoding: QWEN_LOOKAHEAD=N enables it with window N.
+    // 0 (default) = plain autoregressive. The output is identical token-for-token
+    // either way (every speculated token is verified); only speed differs.
+    let lookahead_n: usize = std::env::var("QWEN_LOOKAHEAD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut guesses: Vec<i32> = if lookahead_n > 0 { vec![token; lookahead_n] } else { Vec::new() };
+    let mut pending: std::collections::VecDeque<i32> = std::collections::VecDeque::new();
+    let mut win_embeds: Vec<f32> = Vec::new();
+    let (mut la_batches, mut la_committed) = (0u64, 0u64); // acceptance telemetry
+
     while n_generated < max_tokens {
         n_generated += 1;
 
@@ -381,14 +405,77 @@ fn transcribe_segment(
             }
         }
 
-        unsafe { tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim) };
-        token = decoder::decoder_forward(
-            &ctx.model.decoder,
-            cfg,
-            &mut ctx.kv_cache,
-            &mut ctx.rope_cache,
-            &mut ctx.dec_bufs,
-            &tmp_embed,
+        // Advance to the next token.
+        if lookahead_n == 0 {
+            unsafe { tok_embed_bf16_to_f32(&mut tmp_embed, tok_emb, token, dim) };
+            token = decoder::decoder_forward(
+                &ctx.model.decoder,
+                cfg,
+                &mut ctx.kv_cache,
+                &mut ctx.rope_cache,
+                &mut ctx.dec_bufs,
+                &tmp_embed,
+            );
+        } else {
+            if pending.is_empty() {
+                // One batched forward over [cur, guess0, guess1, ...] yields the
+                // model's correct next-token at every position; accept the longest
+                // run of guesses that matched. Lossless: cur's continuation is
+                // always preds[0]; each later token is taken only if its guess held.
+                let wlen = 1 + guesses.len();
+                win_embeds.resize(wlen * dim, 0.0);
+                unsafe {
+                    tok_embed_bf16_to_f32(&mut win_embeds[0..dim], tok_emb, token, dim);
+                    for (i, &g) in guesses.iter().enumerate() {
+                        tok_embed_bf16_to_f32(
+                            &mut win_embeds[(i + 1) * dim..(i + 2) * dim],
+                            tok_emb,
+                            g,
+                            dim,
+                        );
+                    }
+                }
+                let start_pos = ctx.kv_cache.len;
+                let preds = decoder::decoder_forward_batch(
+                    &ctx.model.decoder,
+                    cfg,
+                    &mut ctx.kv_cache,
+                    &mut ctx.rope_cache,
+                    &mut ctx.dec_bufs,
+                    &win_embeds,
+                    wlen,
+                );
+                let mut n_accept = 1usize;
+                for i in 0..guesses.len() {
+                    if guesses[i] == preds[i] {
+                        n_accept += 1;
+                    } else {
+                        break;
+                    }
+                }
+                la_batches += 1;
+                la_committed += n_accept as u64;
+                // Commit only the verified positions; discard speculative KV.
+                ctx.kv_cache.len = start_pos + n_accept;
+                for &t in &preds[0..n_accept] {
+                    pending.push_back(t);
+                }
+                // Jacobi update: rejected-tail predictions seed the next guesses.
+                let pad = *preds.last().unwrap();
+                let mut ng: Vec<i32> = preds[n_accept..].to_vec();
+                while ng.len() < lookahead_n {
+                    ng.push(pad);
+                }
+                ng.truncate(lookahead_n);
+                guesses = ng;
+            }
+            token = pending.pop_front().unwrap();
+        }
+    }
+    if lookahead_n > 0 && la_batches > 0 {
+        eprintln!(
+            "[lookahead] window={lookahead_n} batches={la_batches} committed={la_committed} avg_accept={:.2}",
+            la_committed as f64 / la_batches as f64
         );
     }
 
@@ -529,7 +616,7 @@ fn transcribe_with_recovery(
         // never reads back as DEGENERATE and perf_segments stays == the emitted-segment count.
         let segments_before = ctx.perf_segments;
         let maxed_before = ctx.perf_maxed_segments;
-        let (text, _n, degenerate) = match transcribe_segment(ctx, seg_ptr, tokenizer, None) {
+        let (text, _n, degenerate) = match transcribe_segment(ctx, seg_ptr, tokenizer, None, None) {
             Some(r) => r,
             None => continue,
         };
@@ -813,7 +900,7 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
 
     // No splitting if segment_sec is 0 or audio fits in one segment
     if ctx.segment_sec <= 0.0 || audio_samples.len() <= target_samples + margin_samples {
-        let (text, _, _) = transcribe_segment(ctx, &audio_samples, tokenizer, None)?;
+        let (text, _, _) = transcribe_segment(ctx, &audio_samples, tokenizer, None, None)?;
         return Some(text);
     }
 
@@ -837,6 +924,91 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     let mut result = String::new();
     let min_samples = SAMPLE_RATE as usize / 2;
     let use_past_text = ctx.past_text_conditioning;
+
+    // Pipelined encode ‖ decode (QWEN_PIPELINE=1): a background thread encodes the
+    // next segment(s) — encoder GEMMs on the ANE when --mac-ane-encoder is set,
+    // and CPU work on a SEPARATE thread pool (use_encoder_pool) so it never shares
+    // dispatch state with the main decoder's pool. The two overlap, hiding the
+    // ~30% encoder under the ~70% decoder. Output is identical to the serial path.
+    if std::env::var("QWEN_PIPELINE").map(|v| v == "1").unwrap_or(false) {
+        let worker_cfg = {
+            let mut c = ctx.model.config.clone();
+            if let Some(w) = ctx.enc_n_window_infer_override {
+                c.enc_n_window_infer = w;
+            }
+            c
+        };
+        let enc_threads: usize = std::env::var("QWEN_ENC_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        let ranges: Vec<(usize, usize)> = (0..n_splits)
+            .map(|s| {
+                let start = splits[s];
+                let end = if s + 1 < n_splits { splits[s + 1] } else { audio_samples.len() };
+                (start, end)
+            })
+            .collect();
+        let worker_model = ctx.model.clone();
+        let audio_ref: &[f32] = &audio_samples;
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Option<(Vec<f32>, usize)>>(2);
+            scope.spawn(move || {
+                // Dedicated encoder-lane pool: re-entrant with the main decoder pool.
+                kernels::use_encoder_pool(enc_threads);
+                let mut enc_bufs = EncoderBuffers::new();
+                for (start, end) in ranges {
+                    let seg_samples = end - start;
+                    let seg_buf: Vec<f32>;
+                    let seg = if seg_samples < min_samples {
+                        let mut b = vec![0.0f32; min_samples];
+                        b[..seg_samples].copy_from_slice(&audio_ref[start..end]);
+                        seg_buf = b;
+                        &seg_buf[..]
+                    } else {
+                        &audio_ref[start..end]
+                    };
+                    if tx.send(encode_segment(&worker_model, &worker_cfg, &mut enc_bufs, seg)).is_err() {
+                        break;
+                    }
+                }
+            });
+            for _ in 0..n_splits {
+                let enc = match rx.recv() {
+                    Ok(Some(e)) => e,
+                    _ => continue,
+                };
+                let past_tokens: Option<Vec<i32>> = if use_past_text && !result.is_empty() {
+                    tokenizer.encode(&result)
+                } else {
+                    None
+                };
+                let seg_text = match transcribe_segment(
+                    ctx, &[], tokenizer, past_tokens.as_deref(), Some(enc),
+                ) {
+                    Some((t, _, _)) if !t.is_empty() => t,
+                    _ => continue,
+                };
+                if !result.is_empty() {
+                    let prev = *result.as_bytes().last().unwrap_or(&0);
+                    let next = *seg_text.as_bytes().first().unwrap_or(&0);
+                    if should_insert_boundary_space(prev, next) {
+                        result.push(' ');
+                        if let Some(ref cb) = ctx.token_cb {
+                            cb(" ");
+                        }
+                    }
+                }
+                if let Some(ref cb) = ctx.token_cb {
+                    if ctx.past_text_conditioning {
+                        cb(&seg_text);
+                    }
+                }
+                result.push_str(&seg_text);
+            }
+        });
+        return Some(result);
+    }
 
     for s in 0..n_splits {
         let core_start = splits[s];
@@ -879,7 +1051,7 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         };
 
         let (seg_text, _seg_text_tokens, _degenerate) =
-            match transcribe_segment(ctx, seg_ptr, tokenizer, past_tokens.as_deref()) {
+            match transcribe_segment(ctx, seg_ptr, tokenizer, past_tokens.as_deref(), None) {
             Some(r) => r,
             None => continue,
         };
@@ -968,7 +1140,7 @@ pub fn transcribe_stream(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         let model = ctx.model.clone();
         let tokenizer = &model.tokenizer;
         ctx.prepare_prompt_tokens(tokenizer);
-        let (text, _, _) = transcribe_segment(ctx, &audio_samples, tokenizer, None)?;
+        let (text, _, _) = transcribe_segment(ctx, &audio_samples, tokenizer, None, None)?;
         return Some(text);
     }
 

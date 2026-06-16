@@ -15,4 +15,17 @@ fn main() {
             }
         }
     }
+
+    // Apple Neural Engine offload: compile the Objective-C CoreML shim and link
+    // the CoreML + Foundation frameworks. macOS-only, behind the `mac-ane` feature.
+    if std::env::var("CARGO_FEATURE_MAC_ANE").is_ok() && target_os == "macos" {
+        println!("cargo:rerun-if-changed=ane/ane_shim.m");
+        cc::Build::new()
+            .file("ane/ane_shim.m")
+            .flag("-fobjc-arc")
+            .flag("-fmodules")
+            .compile("qwen_ane_shim");
+        println!("cargo:rustc-link-lib=framework=CoreML");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+    }
 }

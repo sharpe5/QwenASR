@@ -63,6 +63,8 @@ pub mod decoder;
 pub mod context;
 pub mod transcribe;
 pub mod align;
+#[cfg(all(target_os = "macos", feature = "mac-ane"))]
+pub mod mac_ane;
 #[cfg(any(feature = "ios", feature = "android", feature = "macos-ffi"))]
 pub mod c_api;
 #[cfg(feature = "android")]

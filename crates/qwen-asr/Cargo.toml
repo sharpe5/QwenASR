@@ -17,6 +17,9 @@ name = "qwen_asr"
 [dependencies]
 libc = "0.2"
 
+[build-dependencies]
+cc = "1"
+
 [package.metadata.docs.rs]
 no-default-features = true
 
@@ -27,3 +30,5 @@ vdsp = []
 ios = []
 android = []
 macos-ffi = []
+# Offload matmul to the Apple Neural Engine via CoreML (macOS only).
+mac-ane = []

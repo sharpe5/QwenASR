@@ -925,6 +925,57 @@ pub fn decoder_prefill_logits(
     logits
 }
 
+/// Batched decoder forward over `seq_len` positions, returning the greedy argmax
+/// token at EACH position (not just the last). Writes KV for all positions and
+/// leaves `kv_cache.len = start_pos + seq_len`; the caller is responsible for
+/// rolling `len` back to `start_pos + n_accept` after lookahead verification.
+///
+/// This is the engine of Jacobi/lookahead decoding: one batched forward (weights
+/// read once via the prefill GEMM path) yields the model's correct next-token at
+/// every window position, so a whole run of speculated tokens can be verified at
+/// once. Uses the cheap INT8 argmax per position (no materialized logits).
+pub fn decoder_forward_batch(
+    decoder: &Decoder,
+    cfg: &QwenConfig,
+    kv_cache: &mut KvCache,
+    rope: &mut RopeCache,
+    bufs: &mut DecoderBuffers,
+    input_embeds: &[f32],
+    seq_len: usize,
+) -> Vec<i32> {
+    let dim = cfg.dec_hidden;
+    let eps = cfg.dec_rms_norm_eps;
+    let lm_out_dim = cfg.lm_head_dim();
+
+    // Run the layers (writes KV, fills pref_x with final hidden states).
+    decoder_prefill(decoder, cfg, kv_cache, rope, bufs, input_embeds, seq_len);
+
+    // Final norm over all positions, then per-position argmax.
+    let mut x_norm = vec![0.0f32; seq_len * dim];
+    kernels::rms_norm(&mut x_norm, &bufs.pref_x[..seq_len * dim], &decoder.norm, seq_len, dim, eps);
+
+    let mut preds = Vec::with_capacity(seq_len);
+    for i in 0..seq_len {
+        let xi = &x_norm[i * dim..(i + 1) * dim];
+        #[cfg(target_arch = "aarch64")]
+        let tok = if let (Some(ref d), Some(ref s)) =
+            (&decoder.lm_head_int8, &decoder.lm_head_int8_scales)
+        {
+            kernels::argmax_matvec_int8(xi, d, s, dim, lm_out_dim) as i32
+        } else {
+            let w = decoder.lm_head_bf16.unwrap_or(decoder.tok_embeddings_bf16);
+            kernels::argmax_matvec_bf16(xi, w, dim, lm_out_dim) as i32
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let tok = {
+            let w = decoder.lm_head_bf16.unwrap_or(decoder.tok_embeddings_bf16);
+            kernels::argmax_matvec_bf16(xi, w, dim, lm_out_dim) as i32
+        };
+        preds.push(tok);
+    }
+    preds
+}
+
 /// Convert a token embedding from bf16 to f32.
 ///
 /// # Safety
