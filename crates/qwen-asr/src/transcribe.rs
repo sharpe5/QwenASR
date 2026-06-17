@@ -622,13 +622,13 @@ fn transcribe_with_recovery(
         };
 
         // Recover: split at a WORD BOUNDARY (find_split_point = lowest-energy point within
-        // ±search of the midpoint) and re-decode each half — while depth allows AND the span is
-        // at least 2*min_split. NOTE: the floor gates WHETHER to split, not the exact half sizes:
-        // the cut follows the word gap, so halves can be uneven and one may fall below
-        // loop_min_split_sec. That's deliberate — a clean word-boundary cut matters more than
-        // hitting an exact size (forcing the size would push the cut mid-word). The undersized
-        // half is still a valid short clip; it just won't be split again (it's < 2*min_split).
-        if degenerate && depth < max_depth && seg_len >= 2 * min_split.max(1) {
+        // ±search of the midpoint) and re-decode each half — SIZE-bounded: keep splitting
+        // any degenerate span that is still >= loop_min_split_sec (8s), so a degenerate
+        // block is driven down to < 8s pieces regardless of its original size (75 -> 37 ->
+        // 18 -> 9 -> ~4). `depth < max_depth` is only a safety backstop. NOTE: the cut
+        // follows the word gap, so halves can be uneven and one may fall below the floor —
+        // that's fine; a sub-floor piece is just emitted as-is and not split again.
+        if degenerate && depth < max_depth && seg_len >= min_split.max(1) {
             // This decode is thrown away and replaced by the two halves — roll back its counters.
             ctx.perf_segments = segments_before;
             ctx.perf_maxed_segments = maxed_before;
@@ -924,6 +924,82 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
     let mut result = String::new();
     let min_samples = SAMPLE_RATE as usize / 2;
     let use_past_text = ctx.past_text_conditioning;
+
+    // Batched-ANE pipeline (QWEN_ANE_BATCH=K, K>=2): a background worker encodes K
+    // independent segments at once via `forward_batch` — one large ANE GEMM per
+    // weight instead of K small ones (K× fewer dispatches, ANE-efficient `seq`) —
+    // and streams the encodings to the main thread, which decodes them on the CPU.
+    // ANE-encode ‖ CPU-decode overlap hides the encoder; segments are treated as
+    // independent (no past-text conditioning), matching the coproc's segment model.
+    let ane_batch: usize = std::env::var("QWEN_ANE_BATCH").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    if ane_batch >= 1 {
+        let worker_cfg = {
+            let mut c = ctx.model.config.clone();
+            if let Some(w) = ctx.enc_n_window_infer_override { c.enc_n_window_infer = w; }
+            c
+        };
+        let ranges: Vec<(usize, usize)> = (0..n_splits)
+            .map(|s| (splits[s], if s + 1 < n_splits { splits[s + 1] } else { audio_samples.len() }))
+            .collect();
+        let worker_model = ctx.model.clone();
+        let audio_ref: &[f32] = &audio_samples;
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<f32>, usize)>(2 * ane_batch);
+            scope.spawn(move || {
+                let mut enc_bufs = EncoderBuffers::new();
+                for batch in ranges.chunks(ane_batch) {
+                    // Pad each segment up to the model floor, compute its mel.
+                    let mels: Vec<(Vec<f32>, usize)> = batch
+                        .iter()
+                        .filter_map(|&(start, end)| {
+                            let seg_buf: Vec<f32>;
+                            let seg = if end - start < min_samples {
+                                let mut b = vec![0.0f32; min_samples];
+                                b[..end - start].copy_from_slice(&audio_ref[start..end]);
+                                seg_buf = b;
+                                &seg_buf[..]
+                            } else {
+                                &audio_ref[start..end]
+                            };
+                            audio::mel_spectrogram(seg)
+                        })
+                        .collect();
+                    let mel_refs: Vec<(&[f32], usize)> = mels.iter().map(|(m, f)| (&m[..], *f)).collect();
+                    let encs = worker_model.encoder.forward_batch(&worker_cfg, &mel_refs, &mut enc_bufs);
+                    for enc in encs {
+                        if tx.send(enc).is_err() { return; }
+                    }
+                }
+            });
+            for _ in 0..n_splits {
+                let enc = match rx.recv() { Ok(e) => e, Err(_) => break };
+                // Encode is independent (batched ahead on the ANE), but the DECODE
+                // is sequential and conditions on the running transcript — exactly
+                // as the serial path does — so the output matches it (no repetition
+                // from dropping past-text). The ANE batching is unaffected.
+                let past_tokens: Option<Vec<i32>> = if use_past_text && !result.is_empty() {
+                    tokenizer.encode(&result)
+                } else {
+                    None
+                };
+                let seg_text = match transcribe_segment(ctx, &[], tokenizer, past_tokens.as_deref(), Some(enc)) {
+                    Some((t, _, _)) if !t.is_empty() => t,
+                    _ => continue,
+                };
+                if !result.is_empty() {
+                    let prev = *result.as_bytes().last().unwrap_or(&0);
+                    let next = *seg_text.as_bytes().first().unwrap_or(&0);
+                    if should_insert_boundary_space(prev, next) {
+                        result.push(' ');
+                        if let Some(ref cb) = ctx.token_cb { cb(" "); }
+                    }
+                }
+                if let Some(ref cb) = ctx.token_cb { cb(&seg_text); }
+                result.push_str(&seg_text);
+            }
+        });
+        return Some(result);
+    }
 
     // Pipelined encode ‖ decode (QWEN_PIPELINE=1): a background thread encodes the
     // next segment(s) — encoder GEMMs on the ANE when --mac-ane-encoder is set,

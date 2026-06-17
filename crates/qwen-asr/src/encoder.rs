@@ -358,6 +358,102 @@ impl Encoder {
         })
     }
 
+    /// Conv2D stem for ONE segment: mel `[128, mel_frames]` → the post-stem
+    /// sequence `[total_tokens, d_model]` (Conv2D ×3 → reshape → conv_out
+    /// projection → per-chunk sinusoidal PE), returned as an owned buffer plus
+    /// its `total_tokens`. `bufs` supplies only the transient conv scratch
+    /// (chunk_mel / c1..c3 / reshaped / pe / conv_cols); the returned sequence is
+    /// independent of `bufs.x`, so a caller can run this for several segments and
+    /// concatenate the results (see [`forward_batch`]).
+    fn conv_stem_forward(
+        &self,
+        cfg: &QwenConfig,
+        mel: &[f32],
+        mel_frames: usize,
+        bufs: &mut EncoderBuffers,
+    ) -> (Vec<f32>, usize) {
+        let d_model = cfg.enc_d_model;
+        let chunk_size = cfg.enc_chunk_size;
+        let n_chunks = mel_frames.div_ceil(chunk_size);
+
+        let mut total_tokens = 0;
+        let mut chunk_sizes = Vec::new();
+        for c in 0..n_chunks {
+            let start = c * chunk_size;
+            let end = (start + chunk_size).min(mel_frames);
+            let chunk_w = end - start;
+            let w1 = (chunk_w + 2 - 3) / 2 + 1;
+            let w2 = (w1 + 2 - 3) / 2 + 1;
+            let w3 = (w2 + 2 - 3) / 2 + 1;
+            total_tokens += w3;
+            chunk_sizes.push((start, end, w3));
+        }
+
+        let mut out = vec![0.0f32; total_tokens * d_model];
+        let mut token_offset = 0;
+        for &(start, end, w3) in &chunk_sizes {
+            let chunk_w = end - start;
+            bufs.ensure_stem(chunk_w, d_model);
+
+            let chunk_mel = &mut bufs.chunk_mel[..128 * chunk_w];
+            for m in 0..128 {
+                chunk_mel[m * chunk_w..(m + 1) * chunk_w]
+                    .copy_from_slice(&mel[m * mel_frames + start..m * mel_frames + end]);
+            }
+
+            let h1 = (128 + 2 - 3) / 2 + 1; // 64
+            let w1 = (chunk_w + 2 - 3) / 2 + 1;
+            let c1 = &mut bufs.c1[..CONV_HIDDEN * h1 * w1];
+            kernels::conv2d_with_cols(
+                c1, chunk_mel, &self.conv1_weight, Some(&self.conv1_bias),
+                &mut bufs.conv_cols, 1, CONV_HIDDEN, 128, chunk_w, 3, 3, 2, 1,
+            );
+            kernels::gelu(c1, CONV_HIDDEN * h1 * w1);
+
+            let h2 = (h1 + 2 - 3) / 2 + 1; // 32
+            let w2 = (w1 + 2 - 3) / 2 + 1;
+            let c2 = &mut bufs.c2[..CONV_HIDDEN * h2 * w2];
+            kernels::conv2d_with_cols(
+                c2, c1, &self.conv2_weight, Some(&self.conv2_bias),
+                &mut bufs.conv_cols, CONV_HIDDEN, CONV_HIDDEN, h1, w1, 3, 3, 2, 1,
+            );
+            kernels::gelu(c2, CONV_HIDDEN * h2 * w2);
+
+            let h3 = (h2 + 2 - 3) / 2 + 1; // 16
+            let _w3_calc = (w2 + 2 - 3) / 2 + 1;
+            debug_assert_eq!(_w3_calc, w3);
+            let c3 = &mut bufs.c3[..CONV_HIDDEN * h3 * w3];
+            kernels::conv2d_with_cols(
+                c3, c2, &self.conv3_weight, Some(&self.conv3_bias),
+                &mut bufs.conv_cols, CONV_HIDDEN, CONV_HIDDEN, h2, w2, 3, 3, 2, 1,
+            );
+            kernels::gelu(c3, CONV_HIDDEN * h3 * w3);
+
+            // Reshape [480, h3, w3] -> [w3, 480*h3]
+            let conv_proj_dim = CONV_HIDDEN * h3;
+            let reshaped = &mut bufs.reshaped[..w3 * conv_proj_dim];
+            for ch in 0..CONV_HIDDEN {
+                for f in 0..h3 {
+                    let src_off = ch * h3 * w3 + f * w3;
+                    let dst_col = ch * h3 + f;
+                    for t in 0..w3 {
+                        reshaped[t * conv_proj_dim + dst_col] = c3[src_off + t];
+                    }
+                }
+            }
+
+            // Project [w3, 7680] -> [w3, d_model] (+ sinusoidal PE) into `out`.
+            let projected = &mut out[token_offset * d_model..(token_offset + w3) * d_model];
+            self.conv_out_weight.linear_nobias(projected, reshaped, w3, conv_proj_dim, d_model);
+            let pe = &mut bufs.pe[..w3 * d_model];
+            kernels::sinusoidal_pe(pe, w3, d_model);
+            kernels::add_inplace(projected, pe, w3 * d_model);
+
+            token_offset += w3;
+        }
+        (out, total_tokens)
+    }
+
     /// Run encoder forward pass on mel spectrogram.
     /// mel: [128, mel_frames], returns [total_tokens, output_dim].
     pub fn forward(
@@ -383,147 +479,21 @@ impl Encoder {
             (w2 + 2 - 3) / 2 + 1
         };
 
-        let n_chunks = mel_frames.div_ceil(chunk_size);
-
-        // Pre-calculate total tokens
-        let mut total_tokens = 0;
-        let mut chunk_sizes = Vec::new();
-        for c in 0..n_chunks {
-            let start = c * chunk_size;
-            let end = (start + chunk_size).min(mel_frames);
-            let chunk_w = end - start;
-            let w1 = (chunk_w + 2 - 3) / 2 + 1;
-            let w2 = (w1 + 2 - 3) / 2 + 1;
-            let w3 = (w2 + 2 - 3) / 2 + 1;
-            total_tokens += w3;
-            chunk_sizes.push((start, end, w3));
-        }
-
-        // Transformer + stem scratch buffers (reusable or fresh)
+        // Transformer scratch buffers (reusable or fresh)
         let mut _owned_bufs;
         let bufs: &mut EncoderBuffers = match enc_bufs {
-            Some(b) => {
-                b.ensure(total_tokens, d_model, ffn_dim);
-                b
-            }
+            Some(b) => b,
             None => {
                 _owned_bufs = EncoderBuffers::new();
-                _owned_bufs.ensure(total_tokens, d_model, ffn_dim);
                 &mut _owned_bufs
             }
         };
 
-        // Main sequence buffer: [total_tokens, d_model]
+        // Conv2D stem → post-stem sequence, then size the transformer scratch.
+        let (stem, total_tokens) = self.conv_stem_forward(cfg, mel, mel_frames, bufs);
+        bufs.ensure(total_tokens, d_model, ffn_dim);
         let td = total_tokens * d_model;
-        let mut token_offset = 0;
-
-        // Process each chunk through Conv2D + reshape + project + sinusoidal PE
-        for &(start, end, w3) in &chunk_sizes {
-            let chunk_w = end - start;
-            bufs.ensure_stem(chunk_w, d_model);
-
-            // Extract chunk mel: [128, chunk_w]
-            let chunk_mel = &mut bufs.chunk_mel[..128 * chunk_w];
-            for m in 0..128 {
-                chunk_mel[m * chunk_w..(m + 1) * chunk_w]
-                    .copy_from_slice(&mel[m * mel_frames + start..m * mel_frames + end]);
-            }
-
-            // Conv2D layer 1: [1, 128, chunk_w] -> [480, h1, w1]
-            let h1 = (128 + 2 - 3) / 2 + 1; // 64
-            let w1 = (chunk_w + 2 - 3) / 2 + 1;
-            let c1 = &mut bufs.c1[..CONV_HIDDEN * h1 * w1];
-            kernels::conv2d_with_cols(
-                c1,
-                chunk_mel,
-                &self.conv1_weight,
-                Some(&self.conv1_bias),
-                &mut bufs.conv_cols,
-                1,
-                CONV_HIDDEN,
-                128,
-                chunk_w,
-                3,
-                3,
-                2,
-                1,
-            );
-            kernels::gelu(c1, CONV_HIDDEN * h1 * w1);
-
-            // Conv2D layer 2: [480, h1, w1] -> [480, h2, w2]
-            let h2 = (h1 + 2 - 3) / 2 + 1; // 32
-            let w2 = (w1 + 2 - 3) / 2 + 1;
-            let c2 = &mut bufs.c2[..CONV_HIDDEN * h2 * w2];
-            kernels::conv2d_with_cols(
-                c2,
-                c1,
-                &self.conv2_weight,
-                Some(&self.conv2_bias),
-                &mut bufs.conv_cols,
-                CONV_HIDDEN,
-                CONV_HIDDEN,
-                h1,
-                w1,
-                3,
-                3,
-                2,
-                1,
-            );
-            kernels::gelu(c2, CONV_HIDDEN * h2 * w2);
-
-            // Conv2D layer 3: [480, h2, w2] -> [480, h3, w3]
-            let h3 = (h2 + 2 - 3) / 2 + 1; // 16
-            let _w3_calc = (w2 + 2 - 3) / 2 + 1;
-            debug_assert_eq!(_w3_calc, w3);
-            let c3 = &mut bufs.c3[..CONV_HIDDEN * h3 * w3];
-            kernels::conv2d_with_cols(
-                c3,
-                c2,
-                &self.conv3_weight,
-                Some(&self.conv3_bias),
-                &mut bufs.conv_cols,
-                CONV_HIDDEN,
-                CONV_HIDDEN,
-                h2,
-                w2,
-                3,
-                3,
-                2,
-                1,
-            );
-            kernels::gelu(c3, CONV_HIDDEN * h3 * w3);
-
-            // Reshape [480, h3, w3] -> [w3, 480*h3]
-            // Loop order: ch → f → t for sequential reads from c3
-            let conv_proj_dim = CONV_HIDDEN * h3;
-            let reshaped = &mut bufs.reshaped[..w3 * conv_proj_dim];
-            for ch in 0..CONV_HIDDEN {
-                for f in 0..h3 {
-                    let src_off = ch * h3 * w3 + f * w3;
-                    let dst_col = ch * h3 + f;
-                    for t in 0..w3 {
-                        reshaped[t * conv_proj_dim + dst_col] = c3[src_off + t];
-                    }
-                }
-            }
-
-            // Project: [w3, 7680] -> [w3, d_model]
-            let projected = &mut bufs.x[token_offset * d_model..(token_offset + w3) * d_model];
-            self.conv_out_weight.linear_nobias(
-                projected,
-                reshaped,
-                w3,
-                conv_proj_dim,
-                d_model,
-            );
-
-            // Add per-chunk sinusoidal PE
-            let pe = &mut bufs.pe[..w3 * d_model];
-            kernels::sinusoidal_pe(pe, w3, d_model);
-            kernels::add_inplace(projected, pe, w3 * d_model);
-
-            token_offset += w3;
-        }
+        bufs.x[..td].copy_from_slice(&stem);
 
         // Build attention window boundaries
         let window_token_size = tokens_per_chunk * (n_window_infer / chunk_size);
@@ -663,5 +633,130 @@ impl Encoder {
         );
 
         Some((enc_output, total_tokens))
+    }
+
+    /// Batched encoder forward over K independent segments. Each `mels[i]` is
+    /// `([128, frames_i], frames_i)`; returns one `(enc_output, seq)` per input,
+    /// in order — identical to calling [`forward`] on each, but the per-position
+    /// GEMMs (q/k/v/out projections, FFN, conv_out, proj1/2) are run ONCE over the
+    /// concatenated `[ΣseqᵢΣ, d_model]` sequence. Those GEMMs are row-independent,
+    /// so batching is numerically exact; the win is that the ANE then sees one
+    /// large `seq` (≈ K·366) instead of K small ones — its efficient regime — and
+    /// K× fewer per-call dispatches. Attention stays strictly per-segment (each
+    /// segment keeps its own windows); it is a CPU kernel and never offloaded.
+    ///
+    /// Used by the `--mac-ane` throughput pipeline to saturate the Neural Engine.
+    pub fn forward_batch(
+        &self,
+        cfg: &QwenConfig,
+        mels: &[(&[f32], usize)],
+        enc_bufs: &mut EncoderBuffers,
+    ) -> Vec<(Vec<f32>, usize)> {
+        let d_model = cfg.enc_d_model;
+        let n_heads = cfg.enc_heads;
+        let head_dim = cfg.enc_head_dim;
+        let ffn_dim = cfg.enc_ffn_dim;
+        let output_dim = cfg.enc_output_dim;
+        let chunk_size = cfg.enc_chunk_size;
+        let n_window_infer = cfg.enc_n_window_infer;
+        let tokens_per_chunk = {
+            let w1 = (chunk_size + 2 - 3) / 2 + 1;
+            let w2 = (w1 + 2 - 3) / 2 + 1;
+            (w2 + 2 - 3) / 2 + 1
+        };
+        let window_token_size = tokens_per_chunk * (n_window_infer / chunk_size);
+
+        // Conv stem per segment → concatenate into one [S_total, d_model] sequence.
+        let mut seqs = Vec::with_capacity(mels.len());
+        let mut offsets = Vec::with_capacity(mels.len());
+        let mut s_total = 0usize;
+        let mut stems = Vec::with_capacity(mels.len());
+        for &(mel, frames) in mels {
+            let (stem, seq) = self.conv_stem_forward(cfg, mel, frames, enc_bufs);
+            offsets.push(s_total);
+            s_total += seq;
+            seqs.push(seq);
+            stems.push(stem);
+        }
+        if s_total == 0 {
+            return mels.iter().map(|_| (Vec::new(), 0)).collect();
+        }
+
+        let bufs = enc_bufs;
+        bufs.ensure(s_total, d_model, ffn_dim);
+        let sd = s_total * d_model;
+        for (i, stem) in stems.iter().enumerate() {
+            let off = offsets[i] * d_model;
+            bufs.x[off..off + stem.len()].copy_from_slice(stem);
+        }
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let sf = s_total * ffn_dim;
+
+        // Per-segment attention window boundaries (token indices within each segment).
+        let seg_windows: Vec<Vec<i32>> = seqs
+            .iter()
+            .map(|&seq| {
+                let n_windows = seq.div_ceil(window_token_size.max(1));
+                let mut ws = vec![0i32; n_windows + 1];
+                for (w, slot) in ws.iter_mut().enumerate().take(n_windows) {
+                    *slot = (w * window_token_size) as i32;
+                }
+                ws[n_windows] = seq as i32;
+                ws
+            })
+            .collect();
+
+        for layer in &self.layers {
+            kernels::layer_norm(
+                &mut bufs.x_norm[..sd], &bufs.x[..sd],
+                &layer.attn_norm_weight, &layer.attn_norm_bias, s_total, d_model, 1e-5,
+            );
+            // Batched q/k/v projections (the big ANE GEMMs).
+            layer.wq_weight.linear(&mut bufs.q[..sd], &bufs.x_norm[..sd], Some(&layer.wq_bias), s_total, d_model, d_model);
+            layer.wk_weight.linear(&mut bufs.k[..sd], &bufs.x_norm[..sd], Some(&layer.wk_bias), s_total, d_model, d_model);
+            layer.wv_weight.linear(&mut bufs.v[..sd], &bufs.x_norm[..sd], Some(&layer.wv_bias), s_total, d_model, d_model);
+
+            // Attention is per-segment (own windows); operate on each segment's slice.
+            for (i, &seq) in seqs.iter().enumerate() {
+                let off = offsets[i] * d_model;
+                let len = seq * d_model;
+                let ws = &seg_windows[i];
+                let n_windows = ws.len() - 1;
+                kernels::bidirectional_attention(
+                    &mut bufs.attn_out[off..off + len],
+                    &bufs.q[off..off + len], &bufs.k[off..off + len], &bufs.v[off..off + len],
+                    seq, n_heads, head_dim, scale, ws, n_windows,
+                );
+            }
+
+            // x += wo_bias + attn_out @ woᵀ (batched).
+            layer.wo_weight.linear_accumulate(&mut bufs.x[..sd], &bufs.attn_out[..sd], Some(&layer.wo_bias), s_total, d_model, d_model);
+
+            // FFN (batched).
+            kernels::layer_norm(
+                &mut bufs.x_norm[..sd], &bufs.x[..sd],
+                &layer.ffn_norm_weight, &layer.ffn_norm_bias, s_total, d_model, 1e-5,
+            );
+            layer.fc1_weight.linear(&mut bufs.ffn_mid[..sf], &bufs.x_norm[..sd], Some(&layer.fc1_bias), s_total, d_model, ffn_dim);
+            kernels::gelu(&mut bufs.ffn_mid[..sf], sf);
+            layer.fc2_weight.linear_accumulate(&mut bufs.x[..sd], &bufs.ffn_mid[..sf], Some(&layer.fc2_bias), s_total, ffn_dim, d_model);
+        }
+
+        // Final LayerNorm + projection cascade (batched).
+        kernels::layer_norm(&mut bufs.x_norm[..sd], &bufs.x[..sd], &self.ln_post_weight, &self.ln_post_bias, s_total, d_model, 1e-5);
+        bufs.x[..sd].copy_from_slice(&bufs.x_norm[..sd]);
+        self.proj1_weight.linear(&mut bufs.q[..sd], &bufs.x[..sd], Some(&self.proj1_bias), s_total, d_model, d_model);
+        kernels::gelu(&mut bufs.q[..sd], sd);
+        let mut enc_all = vec![0.0f32; s_total * output_dim];
+        self.proj2_weight.linear(&mut enc_all, &bufs.q[..sd], Some(&self.proj2_bias), s_total, d_model, output_dim);
+
+        // Split back into per-segment outputs.
+        let mut out = Vec::with_capacity(seqs.len());
+        for (i, &seq) in seqs.iter().enumerate() {
+            let off = offsets[i] * output_dim;
+            out.push((enc_all[off..off + seq * output_dim].to_vec(), seq));
+        }
+        out
     }
 }

@@ -354,10 +354,10 @@ fn usage(prog: &str) {
     opt("--profile", "Print per-operation timing breakdown (default: off)");
     opt("--debug", "Debug output (per-layer details) (default: off)");
     opt("--silent", "No status output (only transcription on stdout) (default: off)");
-    opt("--mac-ane", "Apple Neural Engine proof-of-concept: benchmark the encoder matmuls on the ANE (CoreML) vs the CPU and report concurrent CPU+ANE throughput, then exit. Requires a macOS build compiled with `--features mac-ane`. No model needed.");
+    opt("--mac-ane", "Offload the audio encoder's large matmuls (attn + FFN projections) to the Apple Neural Engine during transcription, for POWER EFFICIENCY at maintained throughput. fp32 IO — CPU-equivalent accuracy (see --mac-ane-reconcile). Per-call ANE latency is hidden by running many independent segments concurrently — combine with `--serve --workers N` (or N processes) to saturate the ANE. Requires a macOS build with `--features mac-ane`. (default: off)");
     opt("--mac-ane-reconcile", "Apple Neural Engine reconcile: assert the ANE matmul output matches the CPU `linear` output for the same inputs (cosine + relative error, within fp16 tolerance), then exit. Requires `--features mac-ane`. No model needed.");
+    opt("--mac-ane-bench", "Apple Neural Engine micro-benchmark: CPU vs ANE encoder matmuls + concurrent CPU+ANE throughput, then exit. Requires `--features mac-ane`. No model needed.");
     opt("--pipeline", "Overlap encoding and decoding: a background thread (its own CPU pool) encodes the next segment(s) while the main thread decodes the current one. Output is identical to serial; ~1.1-1.15x faster on multi-segment audio. Override encoder threads with QWEN_ENC_THREADS (default 8). (default: off)");
-    opt("--mac-ane-encoder", "Offload the audio encoder's large matmuls (attn + FFN projections, seq>=512) to the Apple Neural Engine during transcription. fp16 — output is approximate, not bit-exact (see --mac-ane-reconcile). Requires a macOS build with `--features mac-ane`. (default: off)");
     eprintln!("\nServer mode (resident, load-once):");
     opt("--serve <sock>", "Load the model once and answer many transcription requests over an AF_UNIX socket at <sock> (4-byte big-endian length prefix + JSON; request {\"audio\":<path>,\"regions\":[[s,e],…],\"language\":<lang>}, reply {\"text\":..,\"segments\":[…]}). Forces single-threaded matmul; concurrency comes from --workers. Ignores -i/--language/--clip-timestamps (those travel per request).");
     opt("--workers <n>", "Concurrent decoders in --serve mode (default: 1). Each is one QwenCtx + connection decoding single-threaded; all share the mmap'd weights (one physical copy). Open <n> client connections to drive them in parallel.");
@@ -447,7 +447,9 @@ fn main() {
 
     // Apple Neural Engine proof-of-concept (no model needed).
     // --mac-ane-reconcile : assert ANE output == CPU matmul (within fp16).
-    // --mac-ane           : benchmark CPU vs ANE + concurrent throughput.
+    // --mac-ane-bench     : benchmark CPU vs ANE + concurrent throughput.
+    // (--mac-ane itself ENABLES encoder offload during transcription — handled
+    //  in the arg loop below, not here, since it needs the model.)
     if args.iter().any(|a| a == "--mac-ane-reconcile") {
         #[cfg(all(target_os = "macos", feature = "mac-ane"))]
         {
@@ -476,20 +478,20 @@ fn main() {
         #[cfg(not(all(target_os = "macos", feature = "mac-ane")))]
         { eprintln!("--mac-ane-splitk-probe requires a macOS build with `--features mac-ane`."); std::process::exit(1); }
     }
-    if args.iter().any(|a| a == "--mac-ane") {
+    if args.iter().any(|a| a == "--mac-ane-bench") {
         #[cfg(all(target_os = "macos", feature = "mac-ane"))]
         {
             match qwen_asr::mac_ane::benchmark() {
                 Ok(()) => return,
                 Err(e) => {
-                    eprintln!("--mac-ane: {e}");
+                    eprintln!("--mac-ane-bench: {e}");
                     std::process::exit(1);
                 }
             }
         }
         #[cfg(not(all(target_os = "macos", feature = "mac-ane")))]
         {
-            eprintln!("--mac-ane requires a macOS build compiled with `--features mac-ane`.");
+            eprintln!("--mac-ane-bench requires a macOS build compiled with `--features mac-ane`.");
             std::process::exit(1);
         }
     }
@@ -679,7 +681,10 @@ fn main() {
                 // Overlap encoder (own thread pool) with decoder across segments.
                 std::env::set_var("QWEN_PIPELINE", "1");
             }
-            "--mac-ane-encoder" => {
+            // --mac-ane is the production flag: offload the encoder's large GEMMs
+            // to the Apple Neural Engine during transcription (fp32 IO, accurate).
+            // --mac-ane-encoder is kept as a back-compat alias for the same thing.
+            "--mac-ane" | "--mac-ane-encoder" => {
                 #[cfg(all(target_os = "macos", feature = "mac-ane"))]
                 {
                     qwen_asr::mac_ane::set_enabled(true);
@@ -687,7 +692,7 @@ fn main() {
                 }
                 #[cfg(not(all(target_os = "macos", feature = "mac-ane")))]
                 {
-                    eprintln!("--mac-ane-encoder ignored: rebuild with `--features mac-ane` on macOS.");
+                    eprintln!("--mac-ane ignored: rebuild with `--features mac-ane` on macOS.");
                 }
             }
             "-h" | "--help" => {

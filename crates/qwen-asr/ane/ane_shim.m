@@ -23,6 +23,13 @@
 @property(assign) NSInteger inBytes;
 @property(assign) NSInteger outBytes;
 @property(strong) NSString *device;
+// IO geometry, captured at create, for per-call (re-entrant) MLMultiArray wrapping.
+@property(strong) NSArray<NSNumber *> *inShape;
+@property(strong) NSArray<NSNumber *> *outShape;
+@property(strong) NSArray<NSNumber *> *inStrides;
+@property(strong) NSArray<NSNumber *> *outStrides;
+@property(assign) MLMultiArrayDataType inType;
+@property(assign) MLMultiArrayDataType outType;
 @end
 
 @implementation QwenAneModel
@@ -36,6 +43,20 @@ static size_t element_size(MLMultiArrayDataType t) {
         case MLMultiArrayDataTypeInt32:   return 4;
         default: return 4;
     }
+}
+
+// Row-major (C-contiguous) strides, in elements, for a given shape:
+// stride[i] = product of shape[i+1..]. Used to wrap caller buffers directly.
+static NSArray<NSNumber *> *contiguous_strides(NSArray<NSNumber *> *shape) {
+    NSUInteger n = shape.count;
+    NSMutableArray<NSNumber *> *strides = [NSMutableArray arrayWithCapacity:n];
+    for (NSUInteger i = 0; i < n; i++) [strides addObject:@1];
+    NSInteger acc = 1;
+    for (NSInteger i = (NSInteger)n - 1; i >= 0; i--) {
+        strides[i] = @(acc);
+        acc *= shape[i].integerValue;
+    }
+    return strides;
 }
 
 static void copy_string(char *buf, size_t buf_len, NSString *s) {
@@ -155,6 +176,15 @@ void *qwen_ane_create(const uint8_t *spec, size_t spec_len, char *err_buf, size_
         m.outBytes = output.count * element_size(outType);
         m.device = plan_device(compiledURL, config);
 
+        // Capture IO geometry + contiguous (row-major) strides for the re-entrant
+        // per-call path in qwen_ane_run.
+        m.inShape = inShape;
+        m.outShape = outShape;
+        m.inType = inType;
+        m.outType = outType;
+        m.inStrides = contiguous_strides(inShape);
+        m.outStrides = contiguous_strides(outShape);
+
         // Clean up the source .mlmodel (compiled copy is cached by CoreML).
         [[NSFileManager defaultManager] removeItemAtURL:modelURL error:nil];
 
@@ -164,23 +194,61 @@ void *qwen_ane_create(const uint8_t *spec, size_t spec_len, char *err_buf, size_
 
 // x/y are raw element bytes matching the model's declared IO dtype
 // (fp16 by default). x_bytes/y_bytes must equal the model's IO byte sizes.
+//
+// Re-entrant: this binds the caller's x/y buffers directly into per-call
+// MLMultiArrays (initWithDataPointer for the input, outputBackings for the
+// output) instead of reusing buffers stored on the shared handle. A single
+// compiled MLModel can therefore be driven CONCURRENTLY by many worker threads
+// (each with its own x/y) — which is what lets N pipeline lanes saturate the
+// ANE while sharing one set of compiled models (one weight copy). MLModel
+// predictions are thread-safe; only the old shared IO buffers were not.
 int qwen_ane_run(void *handle, const void *x, size_t x_bytes, void *y, size_t y_bytes) {
     @autoreleasepool {
         QwenAneModel *m = (__bridge QwenAneModel *)handle;
         if (!m) return -1;
         if ((NSInteger)x_bytes != m.inBytes || (NSInteger)y_bytes != m.outBytes) return -2;
 
-        memcpy(m.input.dataPointer, x, x_bytes);
-
         NSError *error = nil;
-        id<MLFeatureProvider> out = [m.model predictionFromFeatures:m.provider
-                                                            options:[[MLPredictionOptions alloc] init]
+
+        // Wrap the caller's input buffer (no copy). CoreML only reads it; the
+        // no-op deallocator leaves ownership with the caller.
+        MLMultiArray *input =
+            [[MLMultiArray alloc] initWithDataPointer:(void *)x
+                                                shape:m.inShape
+                                             dataType:m.inType
+                                              strides:m.inStrides
+                                          deallocator:^(void *p){ (void)p; }
+                                                error:&error];
+        if (!input) return -5;
+        MLDictionaryFeatureProvider *provider =
+            [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{@"x": input} error:&error];
+        if (!provider) return -6;
+
+        // Bind the caller's output buffer so CoreML writes results straight into
+        // it (no alloc, no post-copy).
+        MLMultiArray *output =
+            [[MLMultiArray alloc] initWithDataPointer:y
+                                                shape:m.outShape
+                                             dataType:m.outType
+                                              strides:m.outStrides
+                                          deallocator:^(void *p){ (void)p; }
+                                                error:&error];
+        if (!output) return -7;
+        MLPredictionOptions *opts = [[MLPredictionOptions alloc] init];
+        opts.outputBackings = @{@"y": output};
+
+        id<MLFeatureProvider> out = [m.model predictionFromFeatures:provider
+                                                            options:opts
                                                               error:&error];
         if (!out) return -3;
+        // With outputBackings honored, results are already in `y`. Guard against
+        // a CoreML that ignored the backing (returns its own array) by copying.
         MLFeatureValue *yv = [out featureValueForName:@"y"];
         MLMultiArray *arr = yv.multiArrayValue;
-        if (!arr || (NSInteger)(arr.count * element_size(arr.dataType)) != (NSInteger)y_bytes) return -4;
-        memcpy(y, arr.dataPointer, y_bytes);
+        if (arr && arr.dataPointer != y) {
+            if ((NSInteger)(arr.count * element_size(arr.dataType)) != (NSInteger)y_bytes) return -4;
+            memcpy(y, arr.dataPointer, y_bytes);
+        }
         return 0;
     }
 }

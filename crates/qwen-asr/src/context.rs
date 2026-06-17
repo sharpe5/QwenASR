@@ -173,12 +173,16 @@ impl Default for DecodeSettings {
             stream_rollback: 5,
             stream_unfixed_chunks: 99,
             loop_detect: true,
-            // Recovery floor 8s: the shortest segment recovery emits is 8s — spans < 16s
-            // (= 2× the floor) aren't split — so a typical <=33s coarse segment goes 32 -> 16 ->
-            // 8 and stops. loop_max_depth=3 caps total halvings for any larger span; for the
-            // common case the 8s floor is the binding stop.
+            // Recovery is SIZE-bounded: keep halving a degenerate span at a word
+            // boundary until each piece is below loop_min_split_sec (8s), then stop
+            // and emit — independent of the original block size. So 30s -> 15 -> 7,
+            // and 75s -> 37 -> 18 -> 9 -> ~4. The earlier depth-bounded behavior
+            // (cap 3) stopped a 75s block at ~16s, still inside the loop; the size
+            // floor is now the binding stop for any block. loop_max_depth is only a
+            // safety backstop against a non-terminating split — raised well above
+            // what the 8s floor needs (8s·2^12 ≈ 9h) so it never binds in practice.
             loop_min_split_sec: 8.0,
-            loop_max_depth: 3,
+            loop_max_depth: 12,
         }
     }
 }
@@ -463,6 +467,6 @@ mod tests {
         let d = DecodeSettings::default();
         assert!(d.loop_detect);
         assert_eq!(d.loop_min_split_sec, 8.0);
-        assert_eq!(d.loop_max_depth, 3);
+        assert_eq!(d.loop_max_depth, 12);
     }
 }

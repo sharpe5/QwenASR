@@ -25,6 +25,22 @@ use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+// Accelerate's SIMD out-of-place matrix transpose. `C` is M×N, `A` is N×M, with
+// C[i,j] = A[j,i]. Used to pack the engine's row-major `[seq,in]` activation into
+// the CoreML conv's channel-major `[in,seq]` (and unpack the result) far faster
+// than scalar loops — that pack/unpack is the CPU cost that feeds the ANE.
+#[link(name = "Accelerate", kind = "framework")]
+extern "C" {
+    fn vDSP_mtrans(a: *const f32, ia: isize, c: *mut f32, ic: isize, m: usize, n: usize);
+}
+
+/// Transpose `src` [rows, cols] (row-major) into `dst` [cols, rows] (row-major).
+#[inline]
+fn transpose_f32(src: &[f32], dst: &mut [f32], rows: usize, cols: usize) {
+    // dst is cols×rows; dst[i,j] = src[j,i]. vDSP_mtrans(A=src, C=dst, M=cols, N=rows).
+    unsafe { vDSP_mtrans(src.as_ptr(), 1, dst.as_mut_ptr(), 1, cols, rows) };
+}
+
 // ============================================================================
 // Protobuf wire encoding (just enough for the CoreML Model message)
 // ============================================================================
@@ -364,13 +380,11 @@ impl AneLinear {
             }
             return Ok(y);
         }
-        // fp32 IO path (accurate): transpose [seq,in] -> channel-major [in,seq].
+        // fp32 IO path (accurate): transpose [seq,in] -> channel-major [in,seq]
+        // (and back) with Accelerate's SIMD transpose — this pack/unpack is the
+        // per-call CPU work that feeds the ANE, so it must be cheap.
         let mut xt = vec![0.0f32; self.seq * self.in_dim];
-        for s in 0..self.seq {
-            for c in 0..self.in_dim {
-                xt[c * self.seq + s] = x[s * self.in_dim + c];
-            }
-        }
+        transpose_f32(x, &mut xt, self.seq, self.in_dim);
         let mut yt = vec![0.0f32; self.seq * self.out_dim];
         let rc = unsafe {
             qwen_ane_run(
@@ -386,11 +400,7 @@ impl AneLinear {
         }
         // [out, seq] f32 -> [seq, out] f32
         let mut y = vec![0.0f32; self.seq * self.out_dim];
-        for o in 0..self.out_dim {
-            for s in 0..self.seq {
-                y[s * self.out_dim + o] = yt[o * self.seq + s];
-            }
-        }
+        transpose_f32(&yt, &mut y, self.out_dim, self.seq);
         Ok(y)
     }
 
@@ -469,6 +479,29 @@ fn splitk_groups() -> usize {
     })
 }
 
+/// Granularity for bucketing the GEMM `seq` dimension so the compiled CoreML
+/// model is reused across segments (see `try_linear`). The encoder's per-segment
+/// token count drifts by a few tokens (silence-cut boundary, partial final
+/// chunk); rounding `seq` up to a multiple of this granularity collapses that
+/// drift onto a handful of buckets, each compiled once. `QWEN_ANE_SEQ_BUCKET=1`
+/// disables bucketing (exact seq → per-segment recompile, for debugging).
+fn seq_bucket_granularity() -> usize {
+    static B: OnceLock<usize> = OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("QWEN_ANE_SEQ_BUCKET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&b: &usize| b >= 1)
+            .unwrap_or(16)
+    })
+}
+
+/// Round `seq` up to the next multiple of the bucket granularity (>= seq).
+fn seq_bucket(seq: usize) -> usize {
+    let g = seq_bucket_granularity();
+    seq.div_ceil(g) * g
+}
+
 /// Half-open K range `[k0, k1)` for chunk `gi` of `g` over `in_dim`
 /// (remainder folded into the trailing chunks).
 fn chunk_range(in_dim: usize, g: usize, gi: usize) -> (usize, usize) {
@@ -505,11 +538,19 @@ pub fn try_linear(
     }
 
     let g = splitk_groups();
-    let key = (weight_ptr, in_dim, out_dim, seq);
+    // Bucket the seq dimension so the compiled CoreML model is REUSED across
+    // segments. `y = x @ Wᵀ` is row-independent, so running a model built for a
+    // slightly larger `seq_pad` (real rows + zero-padded rows) and keeping only
+    // the first `seq` output rows is bit-identical to an exact-`seq` GEMM — but
+    // the per-weight model is now compiled ONCE per bucket instead of recompiled
+    // every segment (whose token count drifts with the silence-cut boundary).
+    // That per-segment recompile was the encoder-offload's real-seq bottleneck.
+    let seq_pad = seq_bucket(seq);
+    let key = (weight_ptr, in_dim, out_dim, seq_pad);
     let models = {
         let mut map = cache().lock().unwrap();
         map.entry(key)
-            .or_insert_with(|| build_chunk_models(&build_weights(), in_dim, out_dim, seq, g))
+            .or_insert_with(|| build_chunk_models(&build_weights(), in_dim, out_dim, seq_pad, g))
             .clone()
     }?;
 
@@ -521,25 +562,29 @@ pub fn try_linear(
         *I.get_or_init(|| std::env::var("QWEN_ANE_ICOMP").map(|v| v == "1").unwrap_or(false))
     };
 
-    // Run each sub-model on the ANE; accumulate every partial in f32.
+    // Run each sub-model on the ANE; accumulate every partial in f32. Inputs are
+    // gathered into the model's bucketed `seq_pad` rows: the first `seq` rows hold
+    // the real activation columns x[:, k0:k1]; rows [seq, seq_pad) are zero (their
+    // GEMM outputs are computed but never read). Only the first `seq` output rows
+    // are accumulated, so the result is identical to an exact-`seq` GEMM.
     let mut acc = vec![0.0f32; seq * out_dim];
     let mut xg = Vec::new();
     let mut xlo = Vec::new();
     for (k0, k1, model) in models.iter() {
         let kg = k1 - k0;
-        // Gather the strided columns x[:, k0:k1] into a contiguous [seq, kg].
+        // Gather x[:, k0:k1] into a contiguous [seq_pad, kg] (zero-padded tail).
         xg.clear();
-        xg.reserve(seq * kg);
+        xg.resize(seq_pad * kg, 0.0);
         for s in 0..seq {
-            xg.extend_from_slice(&x[s * in_dim + k0..s * in_dim + k1]);
+            xg[s * kg..(s + 1) * kg].copy_from_slice(&x[s * in_dim + k0..s * in_dim + k1]);
         }
         if icomp {
             // x_hi = fp16(x); x_lo = x - x_hi. Run both, sum in f32.
             xlo.clear();
-            xlo.reserve(xg.len());
-            for v in xg.iter_mut() {
+            xlo.resize(xg.len(), 0.0);
+            for (lo, v) in xlo.iter_mut().zip(xg.iter_mut()) {
                 let hi = f16_bits_to_f32(f32_to_f16_bits(*v));
-                xlo.push(*v - hi);
+                *lo = *v - hi;
                 *v = hi;
             }
             let yhi = model.forward(&xg).ok()?;
@@ -558,7 +603,7 @@ pub fn try_linear(
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| {
         eprintln!(
-            "[mac-ane] encoder GEMM on {} (first: in={in_dim} out={out_dim} seq={seq}, split-K={g}, comp={})",
+            "[mac-ane] encoder GEMM on {} (first: in={in_dim} out={out_dim} seq={seq}->{seq_pad}, split-K={g}, comp={})",
             models[0].2.planned_device(), compensate()
         );
     });
