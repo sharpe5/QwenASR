@@ -40,7 +40,7 @@ use serde::Deserialize;
 
 use qwen_asr::config::SUPPORTED_LANGUAGES;
 use qwen_asr::context::{DecodeSettings, QwenCtx, QwenModel};
-use qwen_asr::{kernels, transcribe};
+use qwen_asr::{batch, kernels, transcribe};
 
 use crate::{format_json, load_audio};
 
@@ -279,8 +279,17 @@ fn handle_request(ctx: &mut QwenCtx, body: &[u8], meta: &ServeMeta) -> String {
         .iter()
         .map(|&(s, e)| (ms(s), ms(e)))
         .collect();
+    // `--batch <n>` (carried in the shared DecodeSettings → ctx.batch_size) routes
+    // through the bit-identical 16-way batched decode; 0 keeps the sequential path.
+    let bs = ctx.batch_size;
     let segments = if regions.is_empty() {
-        transcribe::transcribe_segmented(ctx, &samples)
+        if bs > 0 {
+            batch::transcribe_segmented_batched(ctx, &samples, bs)
+        } else {
+            transcribe::transcribe_segmented(ctx, &samples)
+        }
+    } else if bs > 0 {
+        batch::transcribe_clips_batched(ctx, &samples, &regions, bs)
     } else {
         transcribe::transcribe_clips(ctx, &samples, &regions)
     };

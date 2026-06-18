@@ -911,3 +911,220 @@ pub unsafe fn argmax_int8_range(
 
     (best, best_val)
 }
+
+// ========================================================================
+// Batched (weight-stationary) INT8 kernels — see crate::batch
+//
+// These process `batch` independent input vectors against ONE shared weight
+// matrix, loading each weight row exactly once and reusing it across all
+// batch lanes. The per-(lane,row) reduction is the IDENTICAL exact-integer
+// `sdot` accumulation used by `matvec_int8` / `argmax_int8_range`, so each
+// lane's result is BIT-IDENTICAL to running that segment alone. Integer dot
+// products are exact regardless of lane grouping, so the single-row reduction
+// used here yields the same i32 sum the original's pair-row reduction does;
+// the f32 scaling (`sum as f32 * x_scale * w_scale`) and any scalar tail are
+// reproduced verbatim. The win is purely weight-bandwidth: the big int8 matrix
+// is streamed from memory once per `batch` lanes instead of once per lane.
+// ========================================================================
+
+/// Process exactly `N` batch lanes (`lane0..lane0+N`) for ONE output row `o`,
+/// whose INT8 weights are `w_row` (scale `ws`). `N` is a compile-time constant,
+/// so the lane loop is fully unrolled and the loaded weight vectors (`wa`/`wb`)
+/// are reused across all `N` lanes from NEON registers — one DRAM stream of
+/// `w_row` feeds N lanes. The per-lane reduction (acc0 32+16-wide, acc1 32-wide,
+/// f32 scalar tail) is identical to `matvec_int8`, so each lane is bit-identical.
+///
+/// # Safety
+/// Pointers/lengths as in [`matvec_int8_batched`]; `lane0+N <= batch`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn matvec_lanes<const N: usize>(
+    ys: &mut [f32], xs_int8: *const i8, x_scales: &[f32],
+    w_row: *const i8, ws: f32, lane0: usize, o: usize,
+    in_dim: usize, out_dim: usize, accumulate: bool,
+) {
+    let mut acc0 = [vdupq_n_s32(0); N];
+    let mut acc1 = [vdupq_n_s32(0); N];
+    let mut k = 0;
+    while k + 32 <= in_dim {
+        let wa = vld1q_s8(w_row.add(k));
+        let wb = vld1q_s8(w_row.add(k + 16));
+        let mut i = 0;
+        while i < N {
+            let x = xs_int8.add((lane0 + i) * in_dim);
+            acc0[i] = sdot_s32(acc0[i], vld1q_s8(x.add(k)), wa);
+            acc1[i] = sdot_s32(acc1[i], vld1q_s8(x.add(k + 16)), wb);
+            i += 1;
+        }
+        k += 32;
+    }
+    while k + 16 <= in_dim {
+        let wa = vld1q_s8(w_row.add(k));
+        let mut i = 0;
+        while i < N {
+            let x = xs_int8.add((lane0 + i) * in_dim);
+            acc0[i] = sdot_s32(acc0[i], vld1q_s8(x.add(k)), wa);
+            i += 1;
+        }
+        k += 16;
+    }
+    let mut i = 0;
+    while i < N {
+        let b = lane0 + i;
+        let xs = x_scales[b];
+        let mut val = vaddvq_s32(vaddq_s32(acc0[i], acc1[i])) as f32 * xs * ws;
+        // f32 scalar tail (dead for in_dim % 16 == 0; kept for parity with matvec_int8)
+        let mut kk = k;
+        let x = xs_int8.add(b * in_dim);
+        while kk < in_dim {
+            val += (*x.add(kk) as f32) * (*w_row.add(kk) as f32) * xs * ws;
+            kk += 1;
+        }
+        let idx = b * out_dim + o;
+        if accumulate { ys[idx] += val; } else { ys[idx] = val; }
+        i += 1;
+    }
+}
+
+/// Weight-stationary batched INT8 matvec. For each output row `o` the weight row
+/// is streamed from DRAM exactly once and applied to every batch lane; lanes are
+/// processed in register-resident const-generic tiles of {8,4,2,1} (each a
+/// separately monomorphized SIMD function — `matvec_lanes::<N>`), so any batch
+/// size composes from those tiles. Bit-identical, per lane, to `matvec_int8`.
+///
+/// 8 is the largest tile: a tile holds `2*N` int32x4 accumulators live, and N=8
+/// (16 vregs) plus the two weight vectors still fits the 32-register NEON file;
+/// N=16+ would spill. A batch of 16/32/64 is therefore two/four/eight 8-lane
+/// tiles per row — still a single DRAM pass of the row per output.
+///
+/// # Safety
+/// `w_int8` must hold `out_dim*in_dim` values; `xs_int8` `batch*in_dim`; `ys`
+/// `batch*out_dim`; `x_scales` `batch`; `w_scales` `out_dim`.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn matvec_int8_batched(
+    ys: &mut [f32], xs_int8: *const i8, x_scales: &[f32],
+    w_int8: *const i8, w_scales: &[f32],
+    batch: usize, in_dim: usize, out_dim: usize, accumulate: bool,
+) {
+    for o in 0..out_dim {
+        let w_row = w_int8.add(o * in_dim);
+        let ws = w_scales[o];
+        let mut lane = 0;
+        while lane + 8 <= batch {
+            matvec_lanes::<8>(ys, xs_int8, x_scales, w_row, ws, lane, o, in_dim, out_dim, accumulate);
+            lane += 8;
+        }
+        if lane + 4 <= batch {
+            matvec_lanes::<4>(ys, xs_int8, x_scales, w_row, ws, lane, o, in_dim, out_dim, accumulate);
+            lane += 4;
+        }
+        if lane + 2 <= batch {
+            matvec_lanes::<2>(ys, xs_int8, x_scales, w_row, ws, lane, o, in_dim, out_dim, accumulate);
+            lane += 2;
+        }
+        if lane < batch {
+            matvec_lanes::<1>(ys, xs_int8, x_scales, w_row, ws, lane, o, in_dim, out_dim, accumulate);
+        }
+    }
+}
+
+/// Update `best`/`best_val` for `N` lanes (`lane0..lane0+N`) at output row `o`.
+/// Const `N` → unrolled lanes, weight vector reused across lanes from registers.
+/// The integer dot is exact (a 2-accumulator 32-wide reduction yields the same
+/// i32 sum as `argmax_int8_range`'s 4-accumulator one), the scale + strict `>`
+/// tie-break match it, so each lane's argmax is bit-identical.
+///
+/// # Safety
+/// Pointers/lengths as in [`argmax_int8_batched`]; `lane0+N <= batch`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn argmax_lanes<const N: usize>(
+    best: &mut [usize], best_val: &mut [f32], xs_int8: *const i8, x_scales: &[f32],
+    w_row: *const i8, ws: f32, lane0: usize, o: usize, in_dim: usize,
+) {
+    let mut acc0 = [vdupq_n_s32(0); N];
+    let mut acc1 = [vdupq_n_s32(0); N];
+    let mut k = 0;
+    while k + 32 <= in_dim {
+        let wa = vld1q_s8(w_row.add(k));
+        let wb = vld1q_s8(w_row.add(k + 16));
+        let mut i = 0;
+        while i < N {
+            let x = xs_int8.add((lane0 + i) * in_dim);
+            acc0[i] = sdot_s32(acc0[i], vld1q_s8(x.add(k)), wa);
+            acc1[i] = sdot_s32(acc1[i], vld1q_s8(x.add(k + 16)), wb);
+            i += 1;
+        }
+        k += 32;
+    }
+    while k + 16 <= in_dim {
+        let wa = vld1q_s8(w_row.add(k));
+        let mut i = 0;
+        while i < N {
+            let x = xs_int8.add((lane0 + i) * in_dim);
+            acc0[i] = sdot_s32(acc0[i], vld1q_s8(x.add(k)), wa);
+            i += 1;
+        }
+        k += 16;
+    }
+    let mut i = 0;
+    while i < N {
+        let b = lane0 + i;
+        let sum_i32 = vaddvq_s32(vaddq_s32(acc0[i], acc1[i]));
+        let mut tail = 0i32;
+        let mut kk = k;
+        let x = xs_int8.add(b * in_dim);
+        while kk < in_dim {
+            tail += (*x.add(kk) as i32) * (*w_row.add(kk) as i32);
+            kk += 1;
+        }
+        let val = (sum_i32 + tail) as f32 * x_scales[b] * ws;
+        if val > best_val[b] {
+            best_val[b] = val;
+            best[b] = o;
+        }
+        i += 1;
+    }
+}
+
+/// Weight-stationary batched INT8 argmax. For every batch lane `b`, returns the
+/// row `o` maximizing `dot(xs[b], w_row) * x_scales[b] * w_scales[o]`, scanning
+/// rows ascending with a strict `>` (ties → lowest index). Each row streams once
+/// from DRAM; lanes run in register-resident const tiles of {8,4,2,1}
+/// (`argmax_lanes::<N>`). Bit-identical, per lane, to `argmax_int8_range(..,0,out_dim)`.
+///
+/// # Safety
+/// Same shape contract as [`matvec_int8_batched`]; `best` holds `batch`.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn argmax_int8_batched(
+    best: &mut [usize], xs_int8: *const i8, x_scales: &[f32],
+    w_int8: *const i8, w_scales: &[f32],
+    batch: usize, in_dim: usize, out_dim: usize,
+) {
+    let mut best_val = vec![-1e30f32; batch];
+    for b in best.iter_mut().take(batch) { *b = 0; }
+    for o in 0..out_dim {
+        let w_row = w_int8.add(o * in_dim);
+        let ws = w_scales[o];
+        let mut lane = 0;
+        while lane + 8 <= batch {
+            argmax_lanes::<8>(best, &mut best_val, xs_int8, x_scales, w_row, ws, lane, o, in_dim);
+            lane += 8;
+        }
+        if lane + 4 <= batch {
+            argmax_lanes::<4>(best, &mut best_val, xs_int8, x_scales, w_row, ws, lane, o, in_dim);
+            lane += 4;
+        }
+        if lane + 2 <= batch {
+            argmax_lanes::<2>(best, &mut best_val, xs_int8, x_scales, w_row, ws, lane, o, in_dim);
+            lane += 2;
+        }
+        if lane < batch {
+            argmax_lanes::<1>(best, &mut best_val, xs_int8, x_scales, w_row, ws, lane, o, in_dim);
+        }
+    }
+}

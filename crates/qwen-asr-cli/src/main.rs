@@ -328,6 +328,7 @@ fn usage(prog: &str) {
     opt("-t <n>", "Number of threads (default: all CPUs, capped at 10)");
     opt("-S <secs>", &format!("Segment target seconds (default: {}; 0 = full-audio decode). Audio is split into ~30s segments because decoding longer spans makes the model loop and repeat itself; keep this near 30 unless you know what you're doing.", d.segment_sec));
     opt("--weights <f32|bf16>", "Weight residency (default: f32). 'bf16' keeps projection weights BF16-resident (widened per matmul) instead of f32 copies — roughly halves weight RAM, identical math, slightly slower per process.");
+    opt("--batch <n>", &format!("16-way batched offline decode: decode up to <n> ~30s windows at once (weight-stationary INT8 matvec), bit-identical to sequential. 0 = off. Flows through to --serve. (default: {})", d.batch_size));
     opt("-W <secs>", &format!("Segment-cutting silence search window ± seconds (default: {})", d.search_sec));
     opt("--stream", "Streaming mode: process in chunks with prefix rollback (default: off)");
     opt("--stream-max-new-tokens <n>", &format!("Max generated tokens per stream step (default: {})", d.stream_max_new_tokens));
@@ -472,6 +473,11 @@ fn main() {
     let mut json_output = false;
     let mut clip_timestamps: Option<String> = None;
     let mut weights_bf16 = false;
+    // `--batch <n>`: 16-way batched offline decode (beta). 0 = off (sequential).
+    // Decodes up to <n> ~30s segments concurrently with weight-stationary INT8
+    // matvec; bit-identical to the sequential path. Falls back automatically for
+    // streaming / --past-text / aligner / non-aarch64.
+    let mut batch_size: usize = 0;
     // Resident `--serve <sock>` mode: load once, answer many requests over an
     // AF_UNIX socket (see serve.rs). `--workers N` = concurrent decoders (one
     // QwenCtx + connection each, all sharing the mmap'd weights).
@@ -504,6 +510,10 @@ fn main() {
             "--weights" => {
                 i += 1;
                 weights_bf16 = matches!(args.get(i).map(|s| s.as_str()), Some("bf16"));
+            }
+            "--batch" => {
+                i += 1;
+                batch_size = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
             }
             "--stream" => {
                 stream_mode = true;
@@ -720,6 +730,12 @@ fn main() {
     }
     if loop_max_depth >= 0 {
         settings.loop_max_depth = loop_max_depth;
+    }
+    // --batch lives in DecodeSettings (the single source of truth), so it flows to
+    // BOTH the one-shot CLI and `--serve` from this one place — same default, and a
+    // `--batch` passed alongside `--serve` reaches every resident ctx.
+    if batch_size > 0 {
+        settings.batch_size = batch_size;
     }
 
     // Resident serve mode: load the model (×`--workers`) once and answer many
@@ -972,9 +988,18 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        let bs = ctx.batch_size;
         let segments = match clip_regions {
-            Some(ref regions) => transcribe::transcribe_clips(&mut ctx, &samples, regions),
-            None => transcribe::transcribe_segmented(&mut ctx, &samples),
+            Some(ref regions) => if bs > 0 {
+                qwen_asr::batch::transcribe_clips_batched(&mut ctx, &samples, regions, bs)
+            } else {
+                transcribe::transcribe_clips(&mut ctx, &samples, regions)
+            },
+            None => if bs > 0 {
+                qwen_asr::batch::transcribe_segmented_batched(&mut ctx, &samples, bs)
+            } else {
+                transcribe::transcribe_segmented(&mut ctx, &samples)
+            },
         };
         let segments = match segments {
             Some(s) => s,
@@ -1018,9 +1043,18 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        let bs = ctx.batch_size;
         let segments = match clip_regions {
-            Some(ref regions) => transcribe::transcribe_clips(&mut ctx, &samples, regions),
-            None => transcribe::transcribe_segmented(&mut ctx, &samples),
+            Some(ref regions) => if bs > 0 {
+                qwen_asr::batch::transcribe_clips_batched(&mut ctx, &samples, regions, bs)
+            } else {
+                transcribe::transcribe_clips(&mut ctx, &samples, regions)
+            },
+            None => if bs > 0 {
+                qwen_asr::batch::transcribe_segmented_batched(&mut ctx, &samples, bs)
+            } else {
+                transcribe::transcribe_segmented(&mut ctx, &samples)
+            },
         };
         let segments = match segments {
             Some(s) => s,
@@ -1080,7 +1114,13 @@ fn main() {
         // load_audio routes opus/video/wav internally (same as the align branch above),
         // so there's one load path for every input — no per-format special-casing here.
         match load_audio(input_wav.as_ref().unwrap()) {
-            Some(s) => transcribe::transcribe_audio(&mut ctx, &s),
+            Some(s) => {
+                if batch_size > 0 {
+                    qwen_asr::batch::transcribe_audio_batched(&mut ctx, &s, batch_size)
+                } else {
+                    transcribe::transcribe_audio(&mut ctx, &s)
+                }
+            }
             None => None,
         }
     };

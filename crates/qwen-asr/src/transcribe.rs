@@ -10,9 +10,9 @@ use crate::tokenizer::QwenTokenizer;
 use std::time::Instant;
 
 // Prompt token sequences
-const PREFIX_HEAD: &[i32] = &[151644, 8948, 198];
-const PREFIX_TAIL: &[i32] = &[151645, 198, 151644, 872, 198, 151669];
-const SUFFIX_BASE: &[i32] = &[151670, 151645, 198, 151644, 77091, 198];
+pub(crate) const PREFIX_HEAD: &[i32] = &[151644, 8948, 198];
+pub(crate) const PREFIX_TAIL: &[i32] = &[151645, 198, 151644, 872, 198, 151669];
+pub(crate) const SUFFIX_BASE: &[i32] = &[151670, 151645, 198, 151644, 77091, 198];
 
 // Streaming robustness constants (matching C reference)
 const STREAM_DEGEN_MAX_PERIOD: usize = 6;
@@ -449,11 +449,21 @@ fn is_repetition_loop(tokens: &[i32], max_period: usize, min_reps: usize) -> boo
     reps >= min_reps && 2 * reps.saturating_mul(period) >= tokens.len()
 }
 
+/// Bit-identical replica of the degeneracy decision `transcribe_segment` makes
+/// (`loop_detect && (maxed || is_repetition_loop(...))`), exposed so the batched
+/// decode path (`crate::batch`) can reuse the SAME constants/logic without
+/// re-deriving them. `maxed` = the segment ran the full token budget without EOS.
+pub(crate) fn segment_is_degenerate(text_tokens: &[i32], maxed: bool, loop_detect: bool) -> bool {
+    loop_detect
+        && (maxed
+            || is_repetition_loop(text_tokens, SEGMENT_DEGEN_MAX_PERIOD, SEGMENT_DEGEN_MIN_REPEATS))
+}
+
 // ========================================================================
 // Segment-based splitting
 // ========================================================================
 
-fn find_split_point(samples: &[f32], target_sample: usize, search_sec: f32) -> usize {
+pub(crate) fn find_split_point(samples: &[f32], target_sample: usize, search_sec: f32) -> usize {
     let search_half = (search_sec * SAMPLE_RATE as f32) as usize;
     let lo = target_sample.saturating_sub(search_half);
     let hi = (target_sample + search_half).min(samples.len());
@@ -488,7 +498,7 @@ fn find_split_point(samples: &[f32], target_sample: usize, search_sec: f32) -> u
 /// bounded by `loop_max_depth` halvings and the `loop_min_split_sec` size floor. Emitted
 /// sub-segments are sorted back into time order. With `loop_detect` off, nothing is ever
 /// flagged degenerate, so this decodes the span exactly once — identical to legacy behavior.
-fn transcribe_with_recovery(
+pub(crate) fn transcribe_with_recovery(
     ctx: &mut QwenCtx,
     samples: &[f32],
     tokenizer: &QwenTokenizer,
@@ -564,7 +574,7 @@ fn transcribe_with_recovery(
     out.extend(done);
 }
 
-fn should_insert_boundary_space(prev_ch: u8, next_ch: u8) -> bool {
+pub(crate) fn should_insert_boundary_space(prev_ch: u8, next_ch: u8) -> bool {
     if prev_ch == 0 || next_ch == 0 {
         return false;
     }

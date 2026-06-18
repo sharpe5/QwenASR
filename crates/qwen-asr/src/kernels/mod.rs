@@ -1903,6 +1903,48 @@ pub fn argmax_matvec_int8(x: &[f32], w_int8: &[i8], w_scales: &[f32], in_dim: us
     }
 }
 
+/// Weight-stationary batched INT8 matvec (see `neon::matvec_int8_batched`).
+/// `ys`: `batch*out_dim`, `xs_int8`: `batch*in_dim`, `x_scales`: `batch`.
+/// Bit-identical, per lane, to calling `matvec_int8` once per segment.
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_int8_batched(
+    ys: &mut [f32], xs_int8: &[i8], x_scales: &[f32],
+    w_int8: &[i8], w_scales: &[f32],
+    batch: usize, in_dim: usize, out_dim: usize, accumulate: bool,
+) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        neon::matvec_int8_batched(ys, xs_int8.as_ptr(), x_scales, w_int8.as_ptr(), w_scales,
+                                  batch, in_dim, out_dim, accumulate);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (ys, xs_int8, x_scales, w_int8, w_scales, batch, in_dim, out_dim, accumulate);
+        unimplemented!("batched INT8 matvec only implemented for aarch64");
+    }
+}
+
+/// Weight-stationary batched INT8 argmax (see `neon::argmax_int8_batched`).
+/// Fills `best` (len `batch`) with each lane's argmax row. Bit-identical, per
+/// lane, to `argmax_matvec_int8` single-threaded.
+#[allow(clippy::too_many_arguments)]
+pub fn argmax_int8_batched(
+    best: &mut [usize], xs_int8: &[i8], x_scales: &[f32],
+    w_int8: &[i8], w_scales: &[f32],
+    batch: usize, in_dim: usize, out_dim: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        neon::argmax_int8_batched(best, xs_int8.as_ptr(), x_scales, w_int8.as_ptr(), w_scales,
+                                  batch, in_dim, out_dim);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (best, xs_int8, x_scales, w_int8, w_scales, batch, in_dim, out_dim);
+        unimplemented!("batched INT8 argmax only implemented for aarch64");
+    }
+}
+
 pub fn argmax_matvec_bf16(x: &[f32], w_bf16: *const u16, in_dim: usize, out_dim: usize) -> usize {
     let n_threads = get_num_threads();
     if n_threads <= 1 {

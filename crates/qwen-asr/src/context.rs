@@ -157,6 +157,11 @@ pub struct DecodeSettings {
     pub loop_min_split_sec: f32,
     /// `--loop-max-depth`: segment-recovery max halving depth (e.g. 32→16→8 at the 8s floor).
     pub loop_max_depth: i32,
+    /// `--batch`: 16-way batched offline decode (beta). 0 = off (sequential).
+    /// Decodes up to N ~30s windows concurrently with weight-stationary INT8
+    /// matvec; bit-identical to sequential. Shared by the CLI and `--serve` so
+    /// both default identically and a `--batch` flag flows through to serve.
+    pub batch_size: usize,
 }
 
 impl Default for DecodeSettings {
@@ -179,6 +184,10 @@ impl Default for DecodeSettings {
             // common case the 8s floor is the binding stop.
             loop_min_split_sec: 8.0,
             loop_max_depth: 3,
+            // Off by default: the batched path is opt-in via `--batch <n>`. Living
+            // in this single source of truth, the CLI and `--serve` share the default
+            // and a `--batch` flag set on the CLI flows through to `--serve`.
+            batch_size: 0,
         }
     }
 }
@@ -239,6 +248,11 @@ pub struct QwenCtx {
     /// so a 32s degenerate clip goes 32→16→8 (stopping at the 8s floor) and larger spans split
     /// no more than 3 times.
     pub loop_max_depth: i32,
+
+    /// 16-way batched offline decode (`--batch`, default 0 = off). When > 0, the
+    /// offline/segmented/clips paths decode up to this many ~30s windows at once
+    /// (weight-stationary INT8 matvec), bit-identical to sequential. See `crate::batch`.
+    pub batch_size: usize,
 
     /// Per-ctx override for `config.enc_n_window_infer` (CLI `--enc-window-sec`).
     /// `config` is now shared/read-only, so the override lives here and is folded
@@ -323,6 +337,7 @@ impl QwenCtx {
             loop_detect: d.loop_detect,
             loop_min_split_sec: d.loop_min_split_sec,
             loop_max_depth: d.loop_max_depth,
+            batch_size: d.batch_size,
             enc_n_window_infer_override: None,
             prompt: None,
             force_language: None,
@@ -357,6 +372,7 @@ impl QwenCtx {
         self.loop_detect = s.loop_detect;
         self.loop_min_split_sec = s.loop_min_split_sec;
         self.loop_max_depth = s.loop_max_depth;
+        self.batch_size = s.batch_size;
         self.past_text_conditioning = match s.past_text {
             PastText::On => true,
             PastText::Off => false,
