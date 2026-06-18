@@ -22,8 +22,10 @@ The hard constraint is **bit-identical** output. Everything below is shaped by i
 - Verified byte-identical on 15-min clips: **Chinese, Korean, German, French**
   (and English broadcast across `--batch 1/5/16/32`). 73/73 unit+integration
   tests pass.
-- Single-thread speedup on healthy content ≈ **1.5×** (zh 229→141 s, de 237→151 s).
-  Degenerate-heavy content (fr) is ≈parity, not a regression.
+- Performance **knee is `--batch ≈ 4`** (plateau through 32). Uncontended speedup
+  on healthy content is modest (~7–9%: zh 79→74 s, de 83→76 s); it grows under
+  memory-bandwidth pressure. Degenerate-heavy content sees no benefit (recovery is
+  sequential). `--batch 1` is strictly worse than sequential. See the sweep below.
 
 ## Why NEON INT8, not AMX/BLAS
 
@@ -159,19 +161,120 @@ Result: **all byte-identical (`cmp`), `PASS=4 FAIL=0`.** Also byte-identical on
 `bench/samples-compare/broadcast119.wav` (English) for `--batch 1/5/16/32` and on
 the plain-text path.
 
-Single-thread timing (`--batch 16`):
+### Batch-size sweep / performance knee
 
-| lang | sequential | batched (final) | note |
-|------|-----------|-----------------|------|
-| zh | 229 s | 141 s (~1.6×) | healthy |
-| de | 237 s | 151 s (~1.6×) | healthy |
-| ko |  —    | 275 s | mixed (was 410 s before early-abort) |
-| fr | 540 s | 548 s (≈parity) | degenerate-heavy (was 682 s before early-abort) |
+Method: for each batch size the 4 languages run **concurrently** (one process per
+language, each `-t 1`), so contention is uniform across batch sizes and the
+*relative* comparison is valid (M3 Ultra, 28 cores; 4 single-thread decoders do
+not saturate memory bandwidth). Wall-clock seconds for the 15-min `--json` decode,
+**byte-identical across every batch size** (md5 single-valued per language):
 
-Speedup ceiling is ~2×: batching cuts weight DRAM traffic ~N×, but not compute
-(same `sdot` count). Degenerate-heavy audio is recovery-bound (inherently
-sequential), so batching can't speed it up — early-abort just removes the
-double-decode so it doesn't regress.
+| `--batch` | zh (healthy) | de (healthy) | ko (mixed) | fr (degenerate-heavy) |
+|-----------|:----:|:----:|:----:|:----:|
+| 0 (seq) | 79 | 83 | 113 | 197 |
+| 1       | 82 | 85 | 116 | 201 |
+| 2       | 77 | 77 | 113 | 202 |
+| **4**   | **74** | **76** | 114 | 202 |
+| 8       | 74 | 76 | 114 | 202 |
+| 16      | 74 | 75 | 114 | 203 |
+| 32      | 73 | 76 | 114 | 203 |
+
+**Knee = `--batch ≈ 4`.** On healthy content the gain saturates by B=4
+(zh 79→74, de 83→76, ~7–9%) and is flat from 4 through 32 — B≥8 buys nothing
+measurable. **B=1 is strictly worse than sequential** (batched-module overhead
+with no batching benefit; never use it). Degenerate-heavy content (ko, fr) shows
+**no benefit**: it is dominated by sequential loop-recovery, which batching cannot
+accelerate (fr is even ~1% slower from the abort bookkeeping).
+
+**Why modest here, and bandwidth-dependent.** Batching saves weight *memory
+bandwidth*, not *compute* (same total `sdot` count). On an uncontended M3 Ultra the
+decode is largely compute-bound, so the win is single-digit %. The win **grows with
+memory-bandwidth pressure**: earlier numbers measured while the box was also running
+builds + the reference decode showed ~1.5× — partly a contention artifact, but a
+real signal that on a bandwidth-starved machine (or with many concurrent decoders)
+batching helps substantially more. So the right `--batch` is deployment-dependent.
+
+**Recommended default: `--batch 8`** (safely on the plateau, robust to load); use 4
+to minimise per-step working set. Do not bother above ~8 for ~30-window (15-min)
+clips, and never use 1.
+
+### GPU (MLX) feasibility — the batch knee is the *opposite* story
+
+The CPU result above (batching barely helps) is because the CPU does the same total
+`sdot` compute regardless of batch. The GPU is the mirror image: it turns batch into
+throughput. Microbenchmark of the **exact 0.6B decoder matmul stack** (28 layers'
+qkv/o/gate_up/down + lm_head) on MLX f16, M3 Ultra GPU, `mx.eval` per step
+(autoregressive sync), **matmul-only — attention omitted** (optimistic upper bound):
+
+| batch | ms/step | window-tokens/s | TFLOP/s |
+|------:|--------:|----------------:|--------:|
+| 1   | 3.3   | 306    | — |
+| 16  | 7.3   | 2 203  | 2.6 |
+| 32  | 7.4   | 4 314  | 5.1 |
+| 64  | 8.7   | 7 339  | 8.7 |
+| 128 | 12.6  | 10 153 | 12.1 |
+| 256 | 24.0  | 10 686 | 12.7 |
+| 512 | 43.0  | 11 914 | 14.2 |
+| 1024| 78.5  | 13 050 | 15.6 |
+| 2048| 150.7 | 13 589 | 16.2 |
+| 4096| 290.1 | 14 122 | 16.8 |
+
+**GPU throughput knee ≈ batch 64–128.** Below it `ms/step` is flat (~7–9 ms) — pure
+kernel-dispatch-latency regime — so throughput scales ~linearly with batch. Above
+~128 it goes compute-bound (`ms/step` ∝ batch, TFLOP/s saturates ~16–17) and
+throughput plateaus (10 k→14 k from 128→4096). **Sweet spot ≈ 128.**
+
+This explains the earlier "mlx-lm slower than qwen-asr" result: that was **batch=1**,
+where the GPU is latency-bound (306 win-tok/s matmul-only) and loses to the tuned
+CPU INT8 path once real attention + per-token framework overhead are added. The CPU
+can't convert batch into speed; the GPU can — by ~50× from batch 1 to 128.
+
+Caveats before reading this as "port to GPU":
+1. **Matmul-only.** The real decode is ~40% per-window causal attention over a
+   **dynamic KV cache** (ragged across windows). That is the GPU's weak spot and the
+   real engineering cost; end-to-end GPU throughput will be well below this ceiling.
+2. **batch = concurrent 30 s windows.** The production input is **6-hour .opus files
+   ≈ 720 windows each** (21 600 s ÷ 30 s), so batch 64–128 is reachable **from a single
+   file** — the GPU's sweet spot is directly in range, no cross-file juggling needed.
+   (The windows are independent by default — no past-text — so all 720 are batchable.)
+3. **Not bit-identical** (GPU f16 ≠ CPU INT8). It would be a separate production-speed
+   engine validated by WER/transcript parity, not `cmp`.
+
+**With attention included** (MLX fused `scaled_dot_product_attention`, GQA, KV=512 —
+the second microbench, `tmp/mlx_bench3.py`):
+
+| batch | ms/step | window-tokens/s |
+|------:|--------:|----------------:|
+| 1   | 3.7  | 271   |
+| 16  | 8.7  | 1 846 |
+| 32  | 10.3 | 3 118 |
+| 64  | 13.9 | 4 610 |
+| 128 | 23.1 | 5 536 |
+| 256 | 44.3 | 5 783 |
+
+Attention scaling with KV length (batch=128): Lkv 128→7 533, 256→6 969, 512→5 522,
+1024→3 299 win-tok/s — i.e. the per-step attention cost grows ∝ context length, so
+longer prefill / later decode positions cost more.
+
+Adding attention roughly **halves** the matmul-only ceiling (b128: 10 153→5 536) and
+pulls the **knee to ~64–128** (plateau begins ~128). Even so, at batch 128 the GPU
+does ~5 500 window-tokens/s vs the CPU's ~40–50 per window — a ~100× *compute* gap.
+
+Read it honestly though: these microbenches are a **compute ceiling**, not an
+end-to-end number. They omit per-token framework/Python overhead, real ragged-KV
+cache growth + padding/masking, rms-norm/RoPE/q-k-norm, sampling and detokenisation —
+exactly the fixed per-step overheads that sank the earlier **batch=1** mlx-lm test
+(and that amortise away as batch grows). So:
+- **batch 1:** real GPU loses (overhead-bound) — matches the prior result.
+- **batch 64–128:** even if real overhead cuts the ceiling 2–3×, that is still
+  ~1 000–2 500 window-tok/s, i.e. **~20–50× the CPU** — a decisive win *if* the queue
+  can supply that many concurrent windows (batch across many blocks, not one clip).
+
+Bottom line: a **batched MLX GPU engine is worth prototyping for the large-batch
+queue regime** (target batch ~64–128). The remaining risk is engineering, not
+throughput: efficient **ragged-KV batched attention** (windows at different positions)
+and keeping per-step framework overhead low. Reproduce: `tmp/mlx_bench2.py`
+(matmul-only) and `tmp/mlx_bench3.py` (with attention).
 
 ### Reproduce
 ```
@@ -192,8 +295,11 @@ cmp ref.json beta.json && echo IDENTICAL
   a one-pass cost; batching them would need a bit-identical stacked-M BLAS call
   (must be test-gated — Accelerate is not guaranteed identical across M). Candidate
   next win if encode/prefill becomes a larger fraction after the decode win.
-- **Speedup ceiling ~2×** under the bit-identical constraint (compute unchanged).
-  Beating it means cutting compute (AMX/int4/etc.), which changes arithmetic.
+- **Speedup is bandwidth-bound, not large by default.** Batching cuts weight memory
+  traffic, not compute (same `sdot` count), so on an uncontended M3 Ultra it is only
+  ~7–9% on healthy content (knee at B≈4; see the sweep). It grows under
+  memory-bandwidth pressure. Beating it meaningfully means cutting *compute*
+  (AMX f32 / int4 / etc.), which changes arithmetic and breaks bit-identicality.
 - **Degenerate-heavy content** is recovery-bound; batching is ≈parity there.
 - Batched path is **aarch64-only** for now (INT8 NEON); other arches fall back to
   sequential automatically.
