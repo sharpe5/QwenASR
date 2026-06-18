@@ -1,0 +1,220 @@
+# 16-way batched offline decode (beta)
+
+Status: **working, bit-identical, verified on 4 languages × 15 min.** Single
+process, single thread. Opt-in via `--batch <n>` (default `0` = off → unchanged
+sequential path). This doc is the resume-context record for the work.
+
+## Goal
+
+> Create a 1-process, 1-thread version of `process_asr/qwen-asr-beta` that has
+> 16-way batching (compute on batches of 16 ×30s clips at once; leverage 128-bit
+> NEON SIMD — or AMX via BLAS/vDSP if it can stay bit-identical). Iterate until
+> output is **bit-identical** to the original `process_asr/qwen-asr` on **≥4
+> languages with 15-minute clips**, within 8 hours.
+
+The hard constraint is **bit-identical** output. Everything below is shaped by it.
+
+## TL;DR of the result
+
+- `--batch <n>` decodes up to `n` ~30 s windows concurrently, **byte-identical**
+  to the sequential original on the plain-text, `--json`/segmented, and `--serve`
+  paths.
+- Verified byte-identical on 15-min clips: **Chinese, Korean, German, French**
+  (and English broadcast across `--batch 1/5/16/32`). 73/73 unit+integration
+  tests pass.
+- Single-thread speedup on healthy content ≈ **1.5×** (zh 229→141 s, de 237→151 s).
+  Degenerate-heavy content (fr) is ≈parity, not a regression.
+
+## Why NEON INT8, not AMX/BLAS
+
+The autoregressive single-token decode is the dominant cost (thousands of steps,
+each reading the whole ~0.6 B decoder weight set) and on aarch64 it runs as
+**INT8 `sdot` matvec**. AMX (via Accelerate `cblas_sgemm`) is **f32 only** — using
+it for the decode would not reproduce the INT8 arithmetic, so it would break
+bit-identicality. Therefore the decode stays on INT8 NEON.
+
+The encoder + decoder *prefill* already use `cblas_sgemm` (→ AMX) and are left
+**per-window** (run sequentially, reused verbatim → trivially bit-identical).
+They are a one-pass-per-window cost, not the bottleneck, so batching them was not
+needed to satisfy the goal. (Possible future work; see below.)
+
+## The batching idea: weight-stationary, not SIMD-lane-packed
+
+Two ways to "batch":
+
+1. **Pack clips into SIMD lanes** (4 clips in a NEON f32 vector). This changes the
+   reduction order of each dot product → **not bit-identical**. Rejected.
+2. **Weight-stationary reordering** (used here). The decode matvec computes, for
+   each output row `o`, an independent dot product per window. Batching loads each
+   weight row **once** and applies it to all `N` windows, reusing the *identical*
+   per-window reduction. This only reorders *independent* dot products — it never
+   reassociates a single sum — so every value is unchanged.
+
+The win is **weight memory bandwidth**: the big INT8 matrix is streamed from DRAM
+once per `N` windows instead of once per window. The decode is bandwidth-bound on
+weights, so this is the lever. (It does **not** cut compute — same total `sdot`s —
+which is why the ceiling is ~2×, not ~16×.)
+
+### Why it is exactly bit-identical
+
+INT8 `sdot` accumulation is **exact integer arithmetic** (no rounding). The integer
+dot product is the same regardless of how lanes/accumulators are grouped, so the
+batched single-row reduction yields the *same* `i32` sum as the original's pair-row
+reduction. The only float ops are the final `sum as f32 * x_scale * w_scale`
+(reproduced verbatim) and a scalar tail that is dead for these dims (all of
+`dim=1024, q=2048, kv=1024, inter=3072→gate_up 6144, lm=151936` are multiples of
+32). Per-window rms-norm / RoPE / attention (over that window's own KV cache) /
+SwiGLU / quantize all call the **identical kernels per lane**.
+
+Segments that finish (EOS) or hit the token cap drop out of the active set; that
+never touches a still-active segment's math, so each window's token stream — and
+its text — is identical to decoding it alone.
+
+## What was implemented
+
+### New kernels — `crates/qwen-asr/src/kernels/neon.rs`
+- `matvec_int8_batched(ys, xs_int8, x_scales, w_int8, w_scales, batch, in_dim, out_dim, accumulate)`
+- `argmax_int8_batched(best, xs_int8, x_scales, w_int8, w_scales, batch, in_dim, out_dim)`
+- Both dispatch over **const-generic, register-resident lane tiles**
+  `matvec_lanes::<N>` / `argmax_lanes::<N>` for `N ∈ {8,4,2,1}`. Each `N` is a
+  separately **monomorphized** SIMD function with the lane loop unrolled and the
+  loaded weight vectors reused across lanes from registers. Any `--batch n`
+  composes from these tiles (16 = 2×8, 32 = 4×8, 64 = 8×8), still a single DRAM
+  pass of each weight row per output.
+- **Why 8 is the largest tile:** a tile holds `2·N` `int32x4` accumulators live;
+  `N=8` (16 vregs) + the 2 weight vectors fit the 32-register NEON file. `N=16`
+  would spill. (`argmax_lanes` uses a 2-accumulator reduction — still exact, so
+  still bit-identical — to keep register pressure down.)
+- Public wrappers in `kernels/mod.rs`: `matvec_int8_batched`, `argmax_int8_batched`
+  (aarch64 only; `unimplemented!` elsewhere — the batch module falls back to
+  sequential on non-aarch64).
+
+### Orchestration — `crates/qwen-asr/src/batch.rs` (new module)
+- `transcribe_audio_batched(ctx, samples, max_batch)` — batched twin of
+  `transcribe::transcribe_audio` (plain text).
+- `transcribe_segmented_batched` / `transcribe_clips_batched` — batched twins of
+  the `--json` / `--serve` segmented + clips paths.
+- `batched_decode_step` — one batched single-token step reproducing
+  `decoder::decoder_forward`'s aarch64 INT8 path: per-lane rms-norm, batched QKV
+  matvec, per-lane q/k-norm + RoPE + KV-write + causal attention, batched o-proj
+  (residual add), per-lane post-norm, batched gate_up + per-lane SwiGLU, batched
+  down-proj (residual add), per-lane final norm, batched lm-head argmax.
+- Per-window encode + prefill reuse the **existing** `Encoder::forward` and
+  `decoder::decoder_prefill` verbatim (bit-identical), one window at a time, into
+  per-window `KvCache`s. Only the autoregressive loop is batched.
+- Falls back to the sequential path when batching can't apply: non-aarch64,
+  `--past-text` on (sequential dependency between windows), aligner model, a
+  streaming token callback, or `batch < 1`.
+
+### Degeneracy / loop recovery (the 32→16→8 split)
+A coarse ~30 s window that the model loops on is, in the original, decoded by
+`transcribe::transcribe_with_recovery`, which halves it at word boundaries
+(32→16→8 s) and re-decodes. The batched segmented path:
+- Decodes **healthy** windows in batches and emits their text directly.
+- Hands **degenerate** windows to the **unchanged sequential
+  `transcribe_with_recovery`**, which does the bit-identical 32→16→8 halving on the
+  unpadded span. Because the batched decode emits identical tokens, the *same*
+  windows are flagged degenerate (`transcribe::segment_is_degenerate`, reused
+  verbatim), so the splits and every emitted segment are byte-identical.
+
+**Early-abort optimization** (`decode_group(..., loop_detect)`): a window that is
+*already* a repetition loop will go to recovery regardless, so the batched loop
+aborts that lane the moment its partial output trips the authoritative loop check
+(`segment_is_degenerate(partial, maxed=false, true)`, polled every 16 text tokens)
+and hands it to recovery, instead of grinding it to the 2048-token cap inside the
+batch. Bit-identical because aborting only **adds** a window to the recovery set
+(recovery is authoritative); a window emitted directly always completed cleanly
+with a healthy final verdict. The plain `transcribe_audio` path has no recovery, so
+it passes `loop_detect=false` and never aborts.
+
+### Plumbing — shared CLI/serve default
+- `DecodeSettings.batch_size` (in `context.rs`) is the **single source of truth**,
+  so the CLI and `--serve` share the same default (0) and a `--batch n` passed on
+  the `--serve` launch flows through to every resident ctx (`apply_settings`
+  copies it; `serve.rs` routes on `ctx.batch_size`).
+- `--batch <n>` flag in `main.rs`, applied to `settings.batch_size`; routes the
+  plain, `--json`, and `--srt` paths. Shown in `--help`.
+
+## Model facts (0.6B, `qwen3-asr-0.6b`)
+`dec_hidden=1024, dec_layers=28, dec_heads=16, dec_kv_heads=8, dec_head_dim=128,
+dec_intermediate=3072, vocab=151936`. So `q_dim=2048, kv_dim=1024, gate_up=6144,
+lm_head in=1024 out=151936` — all in/out dims are multiples of 32 (no scalar tail).
+Default decode settings: `past_text=Auto→OFF` for offline (windows independent),
+`loop_detect=true` (recovery active).
+
+## Verification
+
+Reference = original `process_asr/qwen-asr` (built `--release`,
+`-C target-cpu=native`). Compare `--json` output byte-for-byte, single thread
+(`-t 1 --silent`).
+
+Test clips (15 min, 16 kHz mono WAV, extracted from `/Users/t/mrecord/datafix/`
+6-hour broadcast opus with `ffmpeg -ss 1800 -t 900 -ar 16000 -ac 1`):
+- zh — `radio-yicai-first-financial-…` (Chinese)
+- ko — `radio-ytn-radio-kr-…` (Korean)
+- de — `tv-welt-de-…` (German)
+- fr — `radio-france-inter-…` (French)
+
+Result: **all byte-identical (`cmp`), `PASS=4 FAIL=0`.** Also byte-identical on
+`bench/samples-compare/broadcast119.wav` (English) for `--batch 1/5/16/32` and on
+the plain-text path.
+
+Single-thread timing (`--batch 16`):
+
+| lang | sequential | batched (final) | note |
+|------|-----------|-----------------|------|
+| zh | 229 s | 141 s (~1.6×) | healthy |
+| de | 237 s | 151 s (~1.6×) | healthy |
+| ko |  —    | 275 s | mixed (was 410 s before early-abort) |
+| fr | 540 s | 548 s (≈parity) | degenerate-heavy (was 682 s before early-abort) |
+
+Speedup ceiling is ~2×: batching cuts weight DRAM traffic ~N×, but not compute
+(same `sdot` count). Degenerate-heavy audio is recovery-bound (inherently
+sequential), so batching can't speed it up — early-abort just removes the
+double-decode so it doesn't regress.
+
+### Reproduce
+```
+# build both
+( cd ../qwen-asr && RUSTFLAGS="-C target-cpu=native" cargo build --release )
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+M=../qwen-asr/qwen3-asr-0.6b
+ORIG=../qwen-asr/target/release/qwen-asr
+BETA=target/release/qwen-asr
+$ORIG -d $M -i clip.wav --language Chinese -t 1 --silent --json > ref.json
+$BETA -d $M -i clip.wav --language Chinese -t 1 --silent --json --batch 16 > beta.json
+cmp ref.json beta.json && echo IDENTICAL
+```
+
+## Known limitations / future work
+- **Encoder + prefill are per-window** (not batched). They use BLAS/AMX f32 and are
+  a one-pass cost; batching them would need a bit-identical stacked-M BLAS call
+  (must be test-gated — Accelerate is not guaranteed identical across M). Candidate
+  next win if encode/prefill becomes a larger fraction after the decode win.
+- **Speedup ceiling ~2×** under the bit-identical constraint (compute unchanged).
+  Beating it means cutting compute (AMX/int4/etc.), which changes arithmetic.
+- **Degenerate-heavy content** is recovery-bound; batching is ≈parity there.
+- Batched path is **aarch64-only** for now (INT8 NEON); other arches fall back to
+  sequential automatically.
+- Default is **off** (`--batch 0`); opt-in. Not yet wired into the mrecord coproc
+  qwen worker launch (would pass `--batch 16` to the `--serve` invocation).
+
+## Reference branches (local, not pushed)
+Snapped in the `qwen-asr-beta` submodule at each verified bit-identical milestone:
+- `progress/2026-06-17-235457-batched-16way-bitident` — batched decode + const-generic kernels
+- `progress/2026-06-18-095101-early-abort-bitident` — + degenerate early-abort
+
+`main` carries the changes **uncommitted** for review (8 files + new `batch.rs`).
+
+## Map of changed files
+- `crates/qwen-asr/src/batch.rs` — **new**, the batched orchestration
+- `crates/qwen-asr/src/kernels/neon.rs` — batched INT8 kernels + const-generic tiles
+- `crates/qwen-asr/src/kernels/mod.rs` — public dispatch wrappers
+- `crates/qwen-asr/src/transcribe.rs` — exposed `pub(crate)` helpers
+  (`find_split_point`, `should_insert_boundary_space`, `transcribe_with_recovery`,
+  `segment_is_degenerate`, the prompt-token consts)
+- `crates/qwen-asr/src/context.rs` — `DecodeSettings.batch_size` + `QwenCtx.batch_size`
+- `crates/qwen-asr/src/lib.rs` — `pub mod batch;`
+- `crates/qwen-asr-cli/src/main.rs` — `--batch` flag, routing, help
+- `crates/qwen-asr-cli/src/serve.rs` — route on `ctx.batch_size`
