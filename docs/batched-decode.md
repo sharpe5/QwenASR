@@ -276,6 +276,43 @@ throughput: efficient **ragged-KV batched attention** (windows at different posi
 and keeping per-step framework overhead low. Reproduce: `tmp/mlx_bench2.py`
 (matmul-only) and `tmp/mlx_bench3.py` (with attention).
 
+### ggml / llama.cpp batched-decode spike — **measured** (the de-risk)
+
+Before committing to a ggml port, we measured ggml's batched decode directly, using
+**off-the-shelf tooling on a size-identical model** (no ASR code written): stock
+`llama-batched-bench` (Homebrew llama.cpp b9690, **Metal**) on a stock **Qwen3-0.6B
+Q8_0** LLM — whose decoder is identical to the qwen-asr decoder (1024 hidden, 28
+layers, 16/8 GQA heads, 128 head_dim). Flash-attention on, `-ngl 99`, PP=448, TG=256:
+
+| batch | decode t/s (total) | per-window t/s | prefill t/s |
+|------:|-------------------:|---------------:|------------:|
+| 1   | 247   | 247 | 12 325 |
+| 4   | 715   | 179 | 12 491 |
+| 16  | 1 232 | 77  | 12 196 |
+| 64  | 3 009 | 47  | 12 369 |
+
+**ggml's batched decode works and scales — 12× from batch 1→64** (247→3 009 decode
+t/s), the **same order as the MLX ceiling** (3 009 vs 4 610 with attention) and
+~60–75× the CPU decoder (~40 t/s/window). Prefill is ~12 k t/s regardless of batch.
+Per-sequence latency *drops* with batch (247→47 t/s/window) — the throughput/latency
+trade — which is exactly right for **offline batch processing of 6-hour files**, wrong
+for low-latency streaming.
+
+Worked estimate for one 6-hour file (~720 windows × ~256 gen tokens ≈ 184 k decode
+tokens): CPU ≈ **~77 min** of decode (batch-invariant); ggml/Metal batch-64 ≈
+184 k/3 009 ≈ **61 s** decode + ~26 s prefill ≈ **~90 s** — i.e. the dominant decode
+path goes from over an hour to ~1 minute.
+
+**Verdict: the ggml path is de-risked.** Its batched decode delivers the throughput
+that justifies the port; it's portable (Metal + CUDA + CPU from one source), and Q8_0
+keeps it int8 (closest to the reference). The **remaining work is building the
+Qwen3-ASR audio-encoder graph in ggml** (the decoder is proven here; the encoder is
+the only model piece ggml lacks). NVIDIA: run the same `llama-batched-bench` with a
+CUDA build on a 3090 to get the matching number (expect higher per-step compute,
+batch capped ~32–64 by 24 GB VRAM). Reproduce: `brew install llama.cpp` then
+`llama-batched-bench -m Qwen3-0.6B-Q8_0.gguf -c 46080 -ngl 99 -fa 1 -npp 448 -ntg 256
+-npl 1,4,16,64`.
+
 ### Reproduce
 ```
 # build both
