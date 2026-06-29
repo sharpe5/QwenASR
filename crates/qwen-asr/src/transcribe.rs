@@ -624,16 +624,18 @@ fn segment_slice(
         return;
     }
 
-    // Build split points over the slice
+    // Build split points over the slice. NO count cap: find_split_point always advances `pos`
+    // by ≥ segment_sec/2, so the loop self-terminates once the remainder fits in one segment —
+    // every segment, including the last, is ≤ segment_sec+margin. A cap here (was 127) instead
+    // dumped the ENTIRE remainder of a long slice into one final segment; for a whole-clip
+    // request that became a multi-hour segment whose encoder/mel/decoder `ensure()` buffers
+    // ballooned to ~1 GB and were retained per ctx (the qwen-asr 54 GB blow-up).
     let mut splits = vec![0usize];
     let mut pos = 0;
     while pos + target_samples + margin_samples < samples.len() {
         let split = find_split_point(samples, pos + target_samples, search_sec);
         splits.push(split);
         pos = split;
-        if splits.len() >= 127 {
-            break;
-        }
     }
     let n_splits = splits.len();
 
@@ -817,16 +819,15 @@ pub fn transcribe_audio(ctx: &mut QwenCtx, samples: &[f32]) -> Option<String> {
         return Some(text);
     }
 
-    // Build split points
+    // Build split points. NO count cap (see segment_slice): the loop self-terminates because
+    // find_split_point advances `pos` by ≥ segment_sec/2 each step, so the last segment is
+    // ≤ segment_sec+margin instead of swallowing the whole remainder into one giant segment.
     let mut splits = vec![0usize];
     let mut pos = 0;
     while pos + target_samples + margin_samples < audio_samples.len() {
         let split = find_split_point(&audio_samples, pos + target_samples, search);
         splits.push(split);
         pos = split;
-        if splits.len() >= 127 {
-            break;
-        }
     }
     let n_splits = splits.len();
 
