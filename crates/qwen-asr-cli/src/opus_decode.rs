@@ -25,10 +25,6 @@ pub enum OpusError {
     /// The container is Ogg but carries no Opus stream (e.g. Vorbis/FLAC-in-Ogg).
     /// The caller can fall back to a general decoder rather than treating it as fatal.
     NotOpus,
-    /// A valid Opus stream that decoded far short of its declared length — a
-    /// truncated/corrupt file. Surfaced loudly instead of silently returning a
-    /// partial buffer (the loud failure ffmpeg's non-zero exit used to give us).
-    Truncated { got_s: f32, expected_s: f32 },
     /// An I/O, demux, or codec error.
     Decode(String),
 }
@@ -37,10 +33,6 @@ impl fmt::Display for OpusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             OpusError::NotOpus => write!(f, "not an Opus-in-Ogg stream"),
-            OpusError::Truncated { got_s, expected_s } => write!(
-                f,
-                "truncated Opus: decoded {got_s:.1}s of a declared {expected_s:.1}s"
-            ),
             OpusError::Decode(e) => write!(f, "{e}"),
         }
     }
@@ -129,15 +121,24 @@ fn decode_opus(
     if !seen_head {
         return Err(OpusError::NotOpus);
     }
-    // Truncation guard: if the granule promised N samples but we decoded far fewer, the
-    // file was cut short. (Chained Ogg under-counts here — the last stream's granule
-    // only — so pcm.len() ≥ expected and this stays quiet, which is the safe direction.)
+    // Short-decode note (NOT an error): if the final-page granule promised more samples
+    // than we decoded, log it and return what we have. The reader reached a clean EOF —
+    // this is the real audio content, not a mid-stream demux failure (those return
+    // Err(Decode) above). mrecord's rolled-restart .opus files splice a fresh Ogg stream
+    // on each capture restart and can leave the granule counter ~20% ahead of the last
+    // audio sample (a benign granule gap); ffmpeg decodes the exact same samples we do,
+    // so there is nothing more to recover. Failing here used to lose the whole block —
+    // transcribe the captured audio instead. Chained Ogg can also under-count (last
+    // stream's granule only), so pcm.len() ≥ expected stays silent.
     if let Some(expected) = expected_len {
         if expected > 0 && pcm.len() < expected * 9 / 10 {
-            return Err(OpusError::Truncated {
-                got_s: pcm.len() as f32 / SAMPLE_RATE as f32,
-                expected_s: expected as f32 / SAMPLE_RATE as f32,
-            });
+            eprintln!(
+                "Note: Opus decoded {:.1}s of a granule-declared {:.1}s (rolled-restart granule gap); \
+                 transcribing the {:.1}s of captured audio.",
+                pcm.len() as f32 / SAMPLE_RATE as f32,
+                expected as f32 / SAMPLE_RATE as f32,
+                pcm.len() as f32 / SAMPLE_RATE as f32,
+            );
         }
     }
     Ok(pcm)
